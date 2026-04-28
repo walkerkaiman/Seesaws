@@ -1,6 +1,6 @@
 # Seesaws
 
-Distributed control system for an interactive seesaw installation. Each seesaw has a **Teensy 4.0** that detects which side is down via a tilt switch, plays a directional LED chase on two WS2813 strips along its length, and broadcasts the event over an **RS485** bus to a central **Raspberry Pi** that plays a sound. Sounds are polyphonic - they overlap freely instead of cutting each other off.
+Distributed control system for an interactive seesaw installation. Each seesaw has a **Teensy 4.0** that detects rocking with an **MPU6050** (firing events on direction reversal so triggers feel responsive at any amplitude - small kids and adults both register at the impact moment), plays a directional LED chase on two WS2813 strips along its length, and broadcasts the event over an **RS485** bus to a central **Raspberry Pi** that plays a sound. Sounds are polyphonic - they overlap freely instead of cutting each other off.
 
 The system is designed to scale to N seesaws with no architectural changes: every seesaw runs the same firmware, only the `SEESAW_ID` differs per flash, and adding a new seesaw on the Pi side is one entry in `config.yaml`.
 
@@ -24,7 +24,7 @@ flowchart LR
             T1[Teensy 4.0]
             X1[MAX3485<br/>RS485 transceiver]
             L1[74AHCT125<br/>3V3 to 5V buffer]
-            B1[Ball tilt switch]
+            B1[MPU6050<br/>accelerometer over I2C]
             D1a[WS2813 strip A]
             D1b[WS2813 strip B]
             Buck1 -->|"local 5V"| T1
@@ -33,7 +33,7 @@ flowchart LR
             Buck1 -->|"local 5V"| D1b
         end
         subgraph SS2 [Seesaw 2 - on the seesaw]
-            Buck2[Buck + Teensy + xcvr + buffer + tilt + 2 strips]
+            Buck2[Buck + Teensy + xcvr + buffer + MPU6050 + 2 strips]
         end
     end
 
@@ -67,10 +67,10 @@ The cable bundle from the rack to each seesaw carries:
 
 ## Behavior
 
-When a seesaw tilts past its threshold, after a 50 ms debounce window:
+Whenever the seesaw reverses direction (the moment one side bottoms out and starts coming back up):
 
-1. The Teensy sends a 6-byte event frame over RS485 announcing `(SEESAW_ID, direction)`.
-2. The Teensy plays the chase animation on both LED strips simultaneously - **forward** for `SIDE_A`, **reverse** for `SIDE_B`. (One CSV; the playback engine reverses index order for the opposite tilt.) A new tilt event interrupts the in-progress chase.
+1. The Teensy sends a 6-byte event frame over RS485 announcing `(SEESAW_ID, direction)` - `direction` is whichever side just bottomed out.
+2. The Teensy plays the chase animation on both LED strips simultaneously - **forward** for `SIDE_A`, **reverse** for `SIDE_B`. (One CSV; the playback engine reverses index order for the opposite side.) A new tilt event interrupts the in-progress chase, after a short configurable cooldown so very fast bounces don't re-stomp on the chase.
 3. The Pi receives the frame, validates the CRC, dedupes against duplicate retransmits, and plays the WAV file mapped to `(seesaw_id, direction)` on a free `pygame.mixer` channel. It does not interrupt sounds already playing.
 
 The Pi is a passive listener; seesaws never wait for an ack. Each event is sent twice on the bus with random jitter to mitigate the rare case of two seesaws tilting simultaneously and colliding on the wire.
@@ -79,7 +79,7 @@ The Pi is a passive listener; seesaws never wait for an ack. Each event is sent 
 
 ### Per seesaw (lives on each unit)
 - 1x Teensy 4.0
-- 1x ball / mercury tilt switch (e.g. SW-520D)
+- 1x **MPU6050 accelerometer breakout** (e.g. GY-521 module, ~$2-5). Mounted to the seesaw frame with one axis aligned along the seesaw's length.
 - 1x **MAX3485** or **SN65HVD3082** (3.3 V RS485 transceiver - **do not use the 5 V MAX485 with Teensy 4.0**, its 3.3 V GPIO is not 5 V tolerant)
 - 1x 74AHCT125 (or 74HCT245) 5 V level-shifting buffer for the LED data lines
 - 2x WS2813 LED strips (length to taste; same length on both sides)
@@ -127,8 +127,9 @@ flowchart LR
         V3["Teensy 3V3 rail"]
         XCVR["MAX3485 VCC"]
         Shifter["74AHCT125 VCC"]
-        Tilt["Ball switch"]
-        Pin2["Teensy pin 2"]
+        MPU["MPU6050 VCC"]
+        Pin18["Teensy pin 18 - I2C SDA"]
+        Pin19["Teensy pin 19 - I2C SCL"]
         Pin8["Teensy pin 8 - LED data 1"]
         Pin14["Teensy pin 14 - LED data 2"]
         Pin0["Teensy pin 0 - Serial1 RX"]
@@ -140,13 +141,16 @@ flowchart LR
     BusV --> Fuse --> Buck --> Local5V
     BusG --> Buck
     BusG --> XCVR
+    BusG --> MPU
     Local5V --> VIN
     Local5V --> Shifter
     Local5V --> Strip1
     Local5V --> Strip2
     VIN --> V3
     V3 --> XCVR
-    V3 --> Tilt --> Pin2
+    V3 --> MPU
+    Pin18 <--> MPU
+    Pin19 --> MPU
     Pin8 --> Shifter --> Strip1
     Pin14 --> Shifter --> Strip2
     Pin0 --> XCVR
@@ -286,7 +290,10 @@ Run a 3-conductor cable between all nodes: A, B, and a GND reference wire. CAT5 
 | Setting | Default | Where to change |
 |---|---|---|
 | Frame rate | 30 FPS | `CHASE_FPS` in `Firmware/Seesaw/config.h` |
-| Tilt debounce | 50 ms | `TILT_DEBOUNCE_MS` in `Firmware/Seesaw/config.h` |
+| Tilt detection | Gyro reversal | `Firmware/Seesaw/config.h` (gyro axis, sign, velocity threshold) |
+| Min motion velocity | 15 deg/s | `TILT_MIN_VELOCITY_DPS` in `Firmware/Seesaw/config.h` |
+| Event cooldown | 150 ms | `TILT_EVENT_COOLDOWN_MS` in `Firmware/Seesaw/config.h` |
+| Tilt sample rate | 100 Hz | `TILT_SAMPLE_INTERVAL_MS` in `Firmware/Seesaw/config.h` |
 | RS485 baud | 115200 | `RS485_BAUD` in firmware AND `serial.baud` in `Audio/config.yaml` |
 | Resend count | 2 | `RS485_RESEND_COUNT` in `Firmware/Seesaw/config.h` |
 | Polyphony | 32 voices | `audio.channels` in `Audio/config.yaml` |

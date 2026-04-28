@@ -2,26 +2,36 @@
 // Seesaw firmware (Teensy 4.0)
 // =====================================================================
 //
-// One ball/mercury tilt switch picks between SIDE_A and SIDE_B. On every
-// debounced state change the firmware:
+// An MPU6050 measures the seesaw's angular velocity on the configured
+// rotation axis. Events fire on direction reversal - the moment one side
+// reaches its lowest point and starts coming back up. This is the impact
+// moment, and it works at any amplitude (small kids and adults trigger
+// the same way). On every event the firmware:
 //
 //   1. Sends a 6-byte event frame over RS485 (announcing this seesaw's
 //      ID and the new direction) to the Pi audio player.
 //
 //   2. Plays the chase animation on both LED strips simultaneously,
 //      forward for SIDE_A and reverse for SIDE_B. A new tilt event
-//      interrupts an in-progress chase.
+//      interrupts an in-progress chase, after a short cooldown so very
+//      fast bounces don't keep stomping on the chase.
 //
 // Hardware:
-//   - Teensy 4.0 powered from a per-seesaw 5V PSU on VIN.
+//   - Teensy 4.0 powered from per-seesaw 24V to 5V buck on VIN.
+//   - MPU6050 breakout on the default Wire bus (pins 18 SDA / 19 SCL).
 //   - WS2813 strips driven via a 74AHCT125 (5V) buffer.
 //   - MAX3485 (3.3V) RS485 transceiver on Serial1 with DE/RE on
 //     PIN_RS485_DE; bus carries A, B and a GND reference wire.
 //
 // Per-board configuration: edit SEESAW_ID in config.h before flashing.
+// Gyro axis, sampling rate, velocity threshold, and event cooldown also
+// live in config.h.
 // =====================================================================
 
 #include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
 #include <WS2812Serial.h>
 
 #include "config.h"
@@ -40,11 +50,15 @@ DMAMEM byte    led2Display[CHASE_NUM_LEDS * 12];
 WS2812Serial   leds2(CHASE_NUM_LEDS, led2Display, led2Drawing,
                      PIN_LED_STRIP_2, WS2811_GRB);
 
-// ---- Tilt state -----------------------------------------------------
+// ---- Gyro / tilt state ---------------------------------------------
 
-int            lastStableTilt = -1;
-int            lastReadTilt   = -1;
-elapsedMillis  tiltDebounceTimer;
+Adafruit_MPU6050 mpu;
+bool           mpuOk = false;
+
+enum MotionDir { MOTION_NONE, MOTION_TOWARD_A, MOTION_TOWARD_B };
+MotionDir      motionDir = MOTION_NONE;
+elapsedMillis  sampleTimer;
+elapsedMillis  cooldownTimer;
 
 // ---- Chase playback -------------------------------------------------
 
@@ -60,20 +74,19 @@ uint8_t        txSeq = 0;
 
 // ---- Forward decls --------------------------------------------------
 
-static void pollTilt();
-static void onTiltChange(int newState);
-static void sendEvent(uint8_t direction);
-static void startChase(uint8_t direction);
-static void tickChase();
-static void drawFrame(int frameIndex);
-static void clearStrips();
-static void showStrips();
+static float   readGyroAxis();
+static void    pollTilt();
+static void    onTiltChange(uint8_t direction);
+static void    sendEvent(uint8_t direction);
+static void    startChase(uint8_t direction);
+static void    tickChase();
+static void    drawFrame(int frameIndex);
+static void    clearStrips();
+static void    showStrips();
 
 // ---- Setup / loop ---------------------------------------------------
 
 void setup() {
-  pinMode(PIN_TILT, INPUT_PULLUP);
-
   Serial1.begin(RS485_BAUD);
   Serial1.transmitterEnable(PIN_RS485_DE);
 
@@ -82,9 +95,20 @@ void setup() {
   clearStrips();
   showStrips();
 
-  lastStableTilt = digitalRead(PIN_TILT);
-  lastReadTilt   = lastStableTilt;
-  tiltDebounceTimer = 0;
+  Wire.begin();
+  Wire.setClock(400000);
+  mpuOk = mpu.begin(MPU_I2C_ADDR, &Wire);
+  if (mpuOk) {
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  }
+
+  // Reversal-based detection only fires on a true direction change, so
+  // a tilted-at-power-up seesaw never produces a spurious chase. The
+  // first event will fire when someone actually rocks the seesaw and
+  // it bottoms out.
+  motionDir = MOTION_NONE;
+  cooldownTimer = TILT_EVENT_COOLDOWN_MS;   // start "expired"
 
   randomSeed(analogRead(A0) ^ micros());
 }
@@ -94,23 +118,54 @@ void loop() {
   tickChase();
 }
 
-// ---- Tilt -----------------------------------------------------------
+// ---- Tilt detection (gyro reversal) --------------------------------
 
-static void pollTilt() {
-  int current = digitalRead(PIN_TILT);
-  if (current != lastReadTilt) {
-    lastReadTilt = current;
-    tiltDebounceTimer = 0;
-    return;
+static float readGyroAxis() {
+  if (!mpuOk) return 0.0f;
+  sensors_event_t a, g, t;
+  mpu.getEvent(&a, &g, &t);
+
+  float v = 0.0f;
+  switch (TILT_GYRO_AXIS) {
+    case TILT_GYRO_AXIS_X: v = g.gyro.x; break;
+    case TILT_GYRO_AXIS_Y: v = g.gyro.y; break;
+    case TILT_GYRO_AXIS_Z: v = g.gyro.z; break;
   }
-  if (current != lastStableTilt && tiltDebounceTimer >= TILT_DEBOUNCE_MS) {
-    lastStableTilt = current;
-    onTiltChange(current);
-  }
+  v *= 180.0f / PI;                        // rad/s -> deg/s
+  return TILT_INVERT ? -v : v;
 }
 
-static void onTiltChange(int newState) {
-  uint8_t direction = (newState == LOW) ? DIR_A : DIR_B;
+static void pollTilt() {
+  if (!mpuOk) return;
+  if (sampleTimer < TILT_SAMPLE_INTERVAL_MS) return;
+  sampleTimer = 0;
+
+  float vel = readGyroAxis();
+
+  // Negative velocity = moving toward SIDE_A, positive = toward SIDE_B.
+  // Inside the +/- TILT_MIN_VELOCITY_DPS dead zone we hold the previous
+  // direction so noise around zero cannot fake a reversal.
+  if (vel <= -TILT_MIN_VELOCITY_DPS) {
+    if (motionDir == MOTION_TOWARD_B
+        && cooldownTimer >= TILT_EVENT_COOLDOWN_MS) {
+      // Reversal at the SIDE_B peak: side B just bottomed out.
+      cooldownTimer = 0;
+      onTiltChange(DIR_B);
+    }
+    motionDir = MOTION_TOWARD_A;
+  } else if (vel >= TILT_MIN_VELOCITY_DPS) {
+    if (motionDir == MOTION_TOWARD_A
+        && cooldownTimer >= TILT_EVENT_COOLDOWN_MS) {
+      // Reversal at the SIDE_A peak: side A just bottomed out.
+      cooldownTimer = 0;
+      onTiltChange(DIR_A);
+    }
+    motionDir = MOTION_TOWARD_B;
+  }
+  // else: in dead zone, motionDir is held.
+}
+
+static void onTiltChange(uint8_t direction) {
   sendEvent(direction);
   startChase(direction);
 }

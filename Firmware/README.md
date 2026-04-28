@@ -5,7 +5,7 @@ This is the per-seesaw Arduino sketch. Every seesaw runs identical code; only `S
 ## Layout
 
 - [Seesaw/Seesaw.ino](Seesaw/Seesaw.ino) - main sketch (`setup` + `loop`, tilt detection, chase playback, RS485 transmit)
-- [Seesaw/config.h](Seesaw/config.h) - `SEESAW_ID`, FPS, pins, baud, debounce, retry settings
+- [Seesaw/config.h](Seesaw/config.h) - `SEESAW_ID`, FPS, pins, baud, tilt thresholds, retry settings
 - [Seesaw/protocol.h](Seesaw/protocol.h) - 6-byte RS485 frame format and CRC-8
 - [Seesaw/chase.h](Seesaw/chase.h) - paste-in chase animation data
 - [tools/csv_to_header.py](tools/csv_to_header.py) - converts a chase CSV into `chase.h`
@@ -18,13 +18,24 @@ This is the per-seesaw Arduino sketch. Every seesaw runs identical code; only `S
 4. **CPU speed**: default 600 MHz is fine
 5. **Optimize**: "Faster" is fine
 
-The only external library used is **`WS2812Serial`**, which is bundled with Teensyduino - no separate install. It's chosen over `Adafruit_NeoPixel` because it uses DMA and does **not** disable interrupts during writes, so RS485 RX bytes are never lost while the LEDs update.
+External libraries (install once via **Arduino IDE -> Library Manager**):
+
+- **`Adafruit MPU6050`** - MPU6050 driver
+- **`Adafruit Unified Sensor`** - dependency of the above (the IDE will offer to pull it in automatically)
+- (`Adafruit BusIO` may also be pulled in as a transitive dependency)
+
+The MPU6050 replaces a mechanical tilt switch and is read in **gyroscope** mode: the firmware watches for direction reversals (the moment the seesaw bottoms out and starts coming back up) instead of crossing an absolute angle threshold. This makes triggers feel responsive at any amplitude, so a small kid rocking the seesaw a few degrees and an adult swinging through 30 degrees both fire events at the impact moment.
+
+**`WS2812Serial`** is bundled with Teensyduino, no separate install. It's chosen over `Adafruit_NeoPixel` because it uses DMA and does **not** disable interrupts during writes, so RS485 RX bytes are never lost while the LEDs update. **`Wire`** is the standard Arduino I2C library and is also bundled.
 
 ## Pin map
 
 | Function | Teensy 4.0 pin | Notes |
 |---|---|---|
-| Tilt switch | 2 (`PIN_TILT`) | INPUT_PULLUP, ball switch to GND |
+| MPU6050 SDA | 18 (default `Wire`) | to MPU6050 SDA pin |
+| MPU6050 SCL | 19 (default `Wire`) | to MPU6050 SCL pin |
+| MPU6050 VCC | 3V3 | most breakouts have an onboard regulator and accept either 3.3 V or 5 V; 3.3 V is safest |
+| MPU6050 GND | GND | common ground |
 | LED strip 1 data | 8 (`PIN_LED_STRIP_1`) | Through 74AHCT125 5V buffer + 470 ohm |
 | LED strip 2 data | 14 (`PIN_LED_STRIP_2`) | Through 74AHCT125 5V buffer + 470 ohm |
 | RS485 RX | 0 (`Serial1` RX) | from MAX3485 RO |
@@ -33,6 +44,8 @@ The only external library used is **`WS2812Serial`**, which is bundled with Teen
 | 5 V power in | VIN | from per-seesaw 24V to 5V buck output (cut VIN/VUSB pad if also using USB) |
 
 `WS2812Serial` only works on Serial-TX-capable pins on Teensy 4.0: `1, 8, 14, 17, 20, 24, 29, 39`. Pin 1 is taken by `Serial1` (RS485), so we use 8 and 14. To change, pick any other two pins from that list and update `config.h`.
+
+The MPU6050's I2C pull-ups are already on the breakout board, so no external pull-up resistors are needed. If you ever stack a second I2C device on the same bus, leave only one set of pull-ups in circuit.
 
 ## On-seesaw block diagram
 
@@ -57,7 +70,7 @@ flowchart LR
         Teensy["Teensy 4.0"]
         Shifter["74AHCT125<br/>(5V powered)"]
         XCVR["MAX3485<br/>(3V3 powered)"]
-        Tilt["Ball tilt switch"]
+        MPU["MPU6050 accelerometer<br/>(3V3 powered, I2C)"]
         Strip1["WS2813 strip 1<br/>+ 1000uF cap, 470 ohm"]
         Strip2["WS2813 strip 2<br/>+ 1000uF cap, 470 ohm"]
     end
@@ -71,7 +84,8 @@ flowchart LR
     Local5V -->|"+5V"| Strip2
 
     Teensy -->|"3V3 rail"| XCVR
-    Teensy -->|"pin 2 with pull-up"| Tilt
+    Teensy -->|"3V3 rail"| MPU
+    Teensy <-->|"pin 18 SDA, pin 19 SCL"| MPU
     Teensy -->|"pin 8"| Shifter
     Teensy -->|"pin 14"| Shifter
     Shifter -->|"DIN"| Strip1
@@ -86,7 +100,7 @@ A short way to read this:
 - The **24 V trunk** comes from the central weatherproof rack box. A small inline fuse on the +24V tap protects the trunk if the local buck shorts.
 - The **buck converter** (sized for this seesaw's worst-case 5 V draw) lives in a small IP65 junction box on the seesaw and produces clean local 5 V. It's the only piece of "outdoor" electronics that needs its own enclosure.
 - The **local 5 V output** powers the LED strips, the level shifter, and the Teensy's `VIN`. The strips never see the trunk voltage, so trunk drop doesn't matter for color stability.
-- The **Teensy's onboard 3V3 regulator** powers the MAX3485 transceiver and the tilt-switch pull-up. The transceiver only draws ~1 mA, well within the 3V3 rail's budget.
+- The **Teensy's onboard 3V3 regulator** powers the MAX3485 transceiver and the MPU6050. Both draw a few mA combined, well within the 3V3 rail's budget.
 - The **74AHCT125** sits between the Teensy data pins and the strips so the WS2813s see clean 5 V edges.
 - The **MAX3485** sits between the Teensy's `Serial1` and the RS485 bus. DE/RE is on pin 6 and is toggled automatically by `Serial1.transmitterEnable()`.
 - The **GND wire on the RS485 cable, the 24 V return, and the buck's GND reference are all the same conductor** - one shared GND ties everything together.
@@ -106,10 +120,60 @@ Other settings that you typically only set once for the whole installation:
 | Constant | Default | Meaning |
 |---|---|---|
 | `CHASE_FPS` | 30 | Animation frame rate |
-| `TILT_DEBOUNCE_MS` | 50 | Stable-read window before a tilt change is accepted |
+| `TILT_GYRO_AXIS` | `TILT_GYRO_AXIS_Y` | Which MPU6050 gyro axis is the seesaw's *rotation* axis (perpendicular to length, see below) |
+| `TILT_INVERT` | `false` | Flip the sign if your mounting gives positive velocity for SIDE_A motion |
+| `TILT_MIN_VELOCITY_DPS` | `15.0f` | Minimum angular velocity (deg/s) before motion is counted as real |
+| `TILT_EVENT_COOLDOWN_MS` | 150 | Suppress further events for this long after firing one |
+| `TILT_SAMPLE_INTERVAL_MS` | 10 | Gyro poll period (100 Hz) |
+| `MPU_I2C_ADDR` | 0x68 | 0x68 default; 0x69 if you've tied AD0 high |
 | `RS485_BAUD` | 115200 | Must match `serial.baud` in the Pi config |
 | `RS485_RESEND_COUNT` | 2 | Times each event is sent on the bus |
 | `RS485_RESEND_JITTER_MIN_MS` / `_MAX_MS` | 5 / 25 | Random gap between resends |
+
+## MPU6050 mounting and axis selection
+
+The MPU6050's gyroscope reports angular velocity around three axes (X, Y, Z). For a seesaw, only one of those three axes carries the rocking motion - the **rotation axis** the seesaw pivots around, which is typically perpendicular to the seesaw's length.
+
+```text
+Seesaw in profile, MPU6050 mounted flat with X along the length:
+
+                  rocking motion
+                       (^)
+                        |
+              SIDE_A down|  ___level___ |SIDE_B down
+                 \      __\______/__   /
+                   \   / __________\__/
+                     \/____pivot___/
+                      |  ^         |
+                      |  | rotation axis = Y
+                      |  | (perpendicular to length, horizontal)
+                      o--o-->  X (along length)
+                         |
+                         v Z (vertical)
+
+  When side A goes down: gyro Y reads negative deg/s
+  When side B goes down: gyro Y reads positive deg/s
+  When still:            gyro Y reads ~0 dps
+```
+
+### Pick the right axis at install time
+
+1. Mount the MPU6050 anywhere on the seesaw - on the frame, the deck, inside an enclosure - with one of its axes aligned along the seesaw's length. The other two axes can be in any orientation as long as the breakout is rigidly attached to the seesaw.
+2. Tilt the seesaw and watch which gyro axis reads nonzero. That's your `TILT_GYRO_AXIS`. (Easiest: temporarily add `Serial.printf("x=%.1f y=%.1f z=%.1f\n", g.gyro.x*57.3, g.gyro.y*57.3, g.gyro.z*57.3);` inside `readGyroAxis()`, plug in USB, open the Serial Monitor, rock the seesaw, and see which axis lights up.)
+3. Set `TILT_GYRO_AXIS` to `TILT_GYRO_AXIS_X`, `_Y`, or `_Z`.
+4. Tilt the seesaw toward your intended `SIDE_A` and watch the sign of that axis. If positive velocity comes out for SIDE_A motion, set `TILT_INVERT = true`. Otherwise leave it `false`.
+5. Tune `TILT_MIN_VELOCITY_DPS` to taste:
+   - **Lower** (5-10 dps) if you want the system to fire even at very gentle rocking. Risk: vibrations may register.
+   - **Higher** (20-30 dps) if you only want firm rocks to count. Risk: a small child's gentle motion may not trigger.
+6. Tune `TILT_EVENT_COOLDOWN_MS` if vigorous rocking is restarting the chase too aggressively (raise it) or if you want every individual reversal to retrigger (lower it, even to 50 ms).
+
+### Why reversal-based detection (instead of an angle threshold)
+
+An angle-threshold approach has a problem: someone rocking the seesaw through a small range never crosses the threshold and never sees any feedback. The system feels broken to that user even though it's working as designed.
+
+Reversal detection sidesteps the issue. Every time the seesaw bottoms out and starts coming back up, an event fires - regardless of how high it went. A small swing and a big swing both register at the impact moment.
+
+A small velocity dead zone around zero (`TILT_MIN_VELOCITY_DPS`) means gyro noise can't fake a reversal when the seesaw is sitting still. The cooldown prevents a fast double-bounce from re-triggering before the chase has a chance to play.
 
 ## Chase data workflow
 
@@ -165,6 +229,12 @@ When you move to the next seesaw, change `SEESAW_ID` and upload again.
 
 - **LEDs work but show wrong colors** -> the strips might not be in `WS2811_GRB` order. WS2813 is normally GRB; if yours is RGB, change the `WS2812Serial` constructor in `Seesaw.ino` from `WS2811_GRB` to `WS2811_RGB`.
 - **First LED stutters or wrong color, rest are fine** -> add the 1000 uF cap and 470 ohm resistor in series with data, and confirm common ground between the Teensy and strip PSU.
-- **Tilt fires multiple times per real change** -> increase `TILT_DEBOUNCE_MS` (try 80-100 ms). Mechanical ball switches can chatter.
+- **No tilt events at all / boots silent** -> the MPU6050 might not be initialising. Confirm SDA/SCL aren't swapped, that the breakout is powered (3V3 + GND), and that `MPU_I2C_ADDR` matches your module (most are 0x68; some pull AD0 high and become 0x69). The firmware deliberately silences all events if `mpu.begin()` fails so a bad sensor doesn't flood the bus.
+- **Tilt fires for the wrong direction** -> set `TILT_INVERT = true` in `config.h` (or the other way around).
+- **Tilt fires for an unrelated motion (yaw / wobble)** -> wrong gyro axis. Print all three axes briefly (see the install-time procedure above), see which one carries the rocking, and update `TILT_GYRO_AXIS`.
+- **Gentle rocking doesn't fire any events** -> motion never exceeds `TILT_MIN_VELOCITY_DPS`. Lower it (try 5-10 dps).
+- **Tilt fires from random vibration / footsteps** -> raise `TILT_MIN_VELOCITY_DPS` (try 25-30 dps).
+- **Chase keeps restarting on fast rocking** -> raise `TILT_EVENT_COOLDOWN_MS` (try 300-500 ms) so the chase has more time to play between events.
+- **Latency feels too high between reversal and event** -> shorten `TILT_SAMPLE_INTERVAL_MS` (try 5 ms / 200 Hz). 100 Hz is already responsive; sub-10 ms latency is hard to perceive.
 - **Pi never receives anything** -> confirm bus termination (120 ohm at both ends, **not** every node), bias resistors at the Pi end, and that A/B aren't swapped. The Teensy's onboard LED is not driven by this firmware so it is not a status indicator - watch the Pi log instead. You can use any USB-serial sniffer to read the bus directly to confirm bytes are coming out of the transceiver.
 - **Pi receives garbage / CRC failures** -> baud mismatch, no bus termination, or A/B swapped on one node. Verify both ends of the cable.

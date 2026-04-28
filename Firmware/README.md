@@ -30,9 +30,66 @@ The only external library used is **`WS2812Serial`**, which is bundled with Teen
 | RS485 RX | 0 (`Serial1` RX) | from MAX3485 RO |
 | RS485 TX | 1 (`Serial1` TX) | to MAX3485 DI |
 | RS485 DE/RE | 6 (`PIN_RS485_DE`) | tied to MAX3485 DE+RE; toggled automatically |
-| 5 V power in | VIN | from per-seesaw 5 V PSU (cut VIN/VUSB pad if also using USB) |
+| 5 V power in | VIN | from per-seesaw 24V to 5V buck output (cut VIN/VUSB pad if also using USB) |
 
 `WS2812Serial` only works on Serial-TX-capable pins on Teensy 4.0: `1, 8, 14, 17, 20, 24, 29, 39`. Pin 1 is taken by `Serial1` (RS485), so we use 8 and 14. To change, pick any other two pins from that list and update `config.h`.
+
+## On-seesaw block diagram
+
+This is what physically lives on a single seesaw and how it connects to the two external buses (24V power and RS485 data). For the installation-level view see the [root README](../README.md#wiring).
+
+```mermaid
+flowchart LR
+    subgraph external [External - from the central rack box]
+        BusV["+24V trunk"]
+        BusG["GND<br/>= RS485 GND ref"]
+        RA["RS485 A"]
+        RB["RS485 B"]
+    end
+
+    subgraph ipbox [Small IP65 junction box on the seesaw]
+        Fuse["3-5A inline fuse"]
+        Buck["24V to 5V buck"]
+    end
+
+    subgraph onseesaw [On the seesaw]
+        Local5V["Local +5V"]
+        Teensy["Teensy 4.0"]
+        Shifter["74AHCT125<br/>(5V powered)"]
+        XCVR["MAX3485<br/>(3V3 powered)"]
+        Tilt["Ball tilt switch"]
+        Strip1["WS2813 strip 1<br/>+ 1000uF cap, 470 ohm"]
+        Strip2["WS2813 strip 2<br/>+ 1000uF cap, 470 ohm"]
+    end
+
+    BusV --> Fuse --> Buck --> Local5V
+    BusG --> Buck
+    BusG -->|GND ref| XCVR
+    Local5V -->|"+5V"| Teensy
+    Local5V -->|"+5V"| Shifter
+    Local5V -->|"+5V"| Strip1
+    Local5V -->|"+5V"| Strip2
+
+    Teensy -->|"3V3 rail"| XCVR
+    Teensy -->|"pin 2 with pull-up"| Tilt
+    Teensy -->|"pin 8"| Shifter
+    Teensy -->|"pin 14"| Shifter
+    Shifter -->|"DIN"| Strip1
+    Shifter -->|"DIN"| Strip2
+    Teensy <-->|"pin 0 RX, pin 1 TX, pin 6 DE+RE"| XCVR
+    XCVR <--> RA
+    XCVR <--> RB
+```
+
+A short way to read this:
+
+- The **24 V trunk** comes from the central weatherproof rack box. A small inline fuse on the +24V tap protects the trunk if the local buck shorts.
+- The **buck converter** (sized for this seesaw's worst-case 5 V draw) lives in a small IP65 junction box on the seesaw and produces clean local 5 V. It's the only piece of "outdoor" electronics that needs its own enclosure.
+- The **local 5 V output** powers the LED strips, the level shifter, and the Teensy's `VIN`. The strips never see the trunk voltage, so trunk drop doesn't matter for color stability.
+- The **Teensy's onboard 3V3 regulator** powers the MAX3485 transceiver and the tilt-switch pull-up. The transceiver only draws ~1 mA, well within the 3V3 rail's budget.
+- The **74AHCT125** sits between the Teensy data pins and the strips so the WS2813s see clean 5 V edges.
+- The **MAX3485** sits between the Teensy's `Serial1` and the RS485 bus. DE/RE is on pin 6 and is toggled automatically by `Serial1.transmitterEnable()`.
+- The **GND wire on the RS485 cable, the 24 V return, and the buck's GND reference are all the same conductor** - one shared GND ties everything together.
 
 ## Per-seesaw configuration
 

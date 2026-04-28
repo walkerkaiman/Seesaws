@@ -16,6 +16,47 @@ See the [root README](../README.md) for system architecture and wiring.
 
 A USB-to-RS485 adapter plugged into any of the Pi's USB ports. Avoid the Pi's GPIO UART for this - level mismatch (Pi GPIO is 3.3 V, classic MAX485 boards are 5 V) and Bluetooth UART contention make it more trouble than it's worth.
 
+### What lives at the central rack
+
+```mermaid
+flowchart LR
+    subgraph rack [Central weatherproof rack box - mains AC inlet]
+        Mains["Mains inlet<br/>+ fused breaker"]
+        PSU24["24V central PSU"]
+        Pi[Raspberry Pi]
+        DAC["Audio out<br/>(USB DAC or Pi 3.5mm)"]
+        Amp["Audio amplifier<br/>(line-in to speaker-level)"]
+        Adapter[USB to RS485 adapter]
+        Bias["Bias resistors<br/>~680 ohm A to 3V3<br/>~680 ohm B to GND<br/>(this end of the bus only)"]
+        Term["120 ohm termination<br/>across A-B<br/>(this end of the bus)"]
+        Mains --> PSU24
+        Mains --> Pi
+        Mains --> Amp
+        Pi --- DAC -->|"line-level"| Amp -->|"speaker-level"| Speakers
+        Pi --- Adapter
+        Adapter --- Bias --- Term
+    end
+    PSU24 -->|"+24V trunk + GND<br/>thin 16-18 AWG to each seesaw"| Field["Per-seesaw bucks + electronics"]
+    Term -->|"RS485 A + B<br/>shares GND with 24V return<br/>up to ~20 ft to farthest seesaw"| Field
+```
+
+Everything mains-fed lives in this rack box: the 24 V PSU that powers the seesaws, the Raspberry Pi, and the audio amplifier. The only electronics outside this box are the seesaws themselves (Teensy, transceiver, level shifter, LED strips) and a small 24V→5V buck converter inside an IP65 junction box on each seesaw - all powered from the rack's 24 V trunk and signaled by the rack's RS485 line.
+
+The other end of the RS485 bus (at the seesaw farthest from the rack) needs its own 120 ohm termination resistor. **Bias resistors go at the rack end only**, never at both ends.
+
+### Amplifier choices
+
+Two practical setups; pick whichever fits your venue:
+
+- **Passive speakers + dedicated amp**: a small Class D board (TPA3116-based 50 W stereo amps are ~$15-25; Adafruit MAX9744 20 W stereo is a tidy ready-made option) driven from the Pi's 3.5 mm jack or a USB DAC. Cleanest signal path, easiest to size to the speakers.
+- **Powered speakers / PA**: skip the discrete amp and feed line-level straight into a self-powered speaker or a small PA system. One fewer box at the rack, but you're locked into whatever the speaker's amp does.
+
+The audio player itself does not care which path you choose - `pygame.mixer` outputs whatever the OS audio device produces. If you're using a USB DAC, set its name as a substring in `audio.device` in `config.yaml`.
+
+The other end of the RS485 bus (at the seesaw cluster) needs its own 120 ohm termination resistor. **Bias resistors go at this end only**, never at both.
+
+### Finding the serial device
+
 After plugging in, find the device:
 
 ```bash

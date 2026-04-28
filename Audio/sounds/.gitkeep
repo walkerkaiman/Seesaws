@@ -1,0 +1,2 @@
+# Drop your WAV files here and reference them from ../config.yaml.
+# Recommended format: 44.1 kHz 16-bit WAV.

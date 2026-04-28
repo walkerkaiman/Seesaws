@@ -1,0 +1,17 @@
+[Unit]
+Description=Seesaws RS485 polyphonic audio player
+After=sound.target network.target
+Wants=sound.target
+
+[Service]
+Type=simple
+User=pi
+Group=audio
+WorkingDirectory=/home/pi/Seesaws/Audio
+Environment=SDL_AUDIODRIVER=alsa
+ExecStart=/home/pi/Seesaws/Audio/.venv/bin/python /home/pi/Seesaws/Audio/seesaw_audio.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

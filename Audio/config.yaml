@@ -1,0 +1,31 @@
+# =====================================================================
+# Seesaws audio player configuration
+# =====================================================================
+#
+# Paths in `sounds:` are resolved relative to this file unless absolute.
+# Direction keys must be "A" or "B" and match the firmware's DIR_A / DIR_B.
+# =====================================================================
+
+serial:
+  # USB-to-RS485 adapter device. On Linux this is usually /dev/ttyUSB0
+  # (find it with `dmesg | tail` after plugging in, or `ls /dev/serial/by-id/`).
+  # On Windows during development, use COM3, COM4, etc.
+  port: /dev/ttyUSB0
+  baud: 115200
+
+audio:
+  frequency: 44100
+  buffer: 512        # smaller = lower latency, larger = fewer underruns
+  channels: 32       # max simultaneous voices; bump if events overlap heavily
+  # device: "USB Audio"  # optional: substring match for a specific output
+
+sounds:
+  1:
+    A: sounds/seesaw1_A.wav
+    B: sounds/seesaw1_B.wav
+  2:
+    A: sounds/seesaw2_A.wav
+    B: sounds/seesaw2_B.wav
+  # 3:
+  #   A: sounds/seesaw3_A.wav
+  #   B: sounds/seesaw3_B.wav

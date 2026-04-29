@@ -218,11 +218,15 @@ static void tickChase() {
   drawFrame(chaseFrame);
 }
 
+static inline uint8_t scaleBrightness(uint8_t v) {
+  return (uint8_t)(((uint16_t)v * (uint16_t)LED_BRIGHTNESS) / 255);
+}
+
 static void drawFrame(int frameIndex) {
   for (int i = 0; i < (int)CHASE_NUM_LEDS; i++) {
-    uint8_t r = pgm_read_byte(&chase[frameIndex][i * 3 + 0]);
-    uint8_t g = pgm_read_byte(&chase[frameIndex][i * 3 + 1]);
-    uint8_t b = pgm_read_byte(&chase[frameIndex][i * 3 + 2]);
+    uint8_t r = scaleBrightness(pgm_read_byte(&chase[frameIndex][i * 3 + 0]));
+    uint8_t g = scaleBrightness(pgm_read_byte(&chase[frameIndex][i * 3 + 1]));
+    uint8_t b = scaleBrightness(pgm_read_byte(&chase[frameIndex][i * 3 + 2]));
     leds1.setPixel(i, r, g, b);
     leds2.setPixel(i, r, g, b);
   }

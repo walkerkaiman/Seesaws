@@ -15,6 +15,16 @@
 // Animation frame rate (frames per second).
 #define CHASE_FPS 30
 
+// Global LED brightness scaler, 0..255. Every R/G/B value coming out of
+// the chase data is multiplied by (LED_BRIGHTNESS / 255) before being
+// written to the strips, so 255 = full brightness (chase data unchanged)
+// and 0 = strips dark. Lower this to cap power draw or tame an
+// over-bright install without re-rendering the chase animation.
+//
+// Rough WS2813 power scaling at 5 V (per LED, full white frame):
+//   255 -> ~60 mA    192 -> ~45 mA    128 -> ~30 mA    64 -> ~15 mA
+#define LED_BRIGHTNESS 255
+
 // ---- Pin assignments (Teensy 4.0) -----------------------------------
 //
 //   I2C_SDA / I2C_SCL  - MPU6050 accelerometer over the default Wire bus.

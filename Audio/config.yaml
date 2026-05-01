@@ -3,7 +3,11 @@
 # =====================================================================
 #
 # Paths in `sounds:` are resolved relative to this file unless absolute.
-# Direction keys must be "A" or "B" and match the firmware's DIR_A / DIR_B.
+# Direction keys must be "A" or "B" and match the firmware's DIR_A / DIR_B
+# (event codes 0 and 1 on the wire). State-change events (EVT_STATE_IDLE,
+# EVT_STATE_PLAY = wire codes 2/3) are also sent by the firmware on every
+# IDLE<->PLAY transition; they're handled by the on_state_change listener
+# stub in seesaw_audio.py and have no entry in this config.
 # =====================================================================
 
 serial:

@@ -1,6 +1,6 @@
 # Seesaws
 
-Distributed control system for an interactive seesaw installation. Each seesaw has a **Teensy 4.0** that detects rocking with an **MPU6050** (firing events on direction reversal so triggers feel responsive at any amplitude - small kids and adults both register at the impact moment), plays a directional LED chase on two WS2813 strips along its length, and broadcasts the event over an **RS485** bus to a central **Raspberry Pi** that plays a sound. Sounds are polyphonic - they overlap freely instead of cutting each other off.
+Distributed control system for an interactive seesaw installation. Each seesaw has a **Teensy 4.0** that detects rocking with an **MPU6050** (firing events on direction reversal so triggers feel responsive at any amplitude - small kids and adults both register at the impact moment), plays a directional LED chase on the pair of WS2813 strips that lives on whichever side just bottomed out (four strips total, 45 LEDs each, two per side; only the triggered side lights up at a time), and broadcasts the event over an **RS485** bus to a central **Raspberry Pi** that plays a sound. Sounds are polyphonic - they overlap freely instead of cutting each other off.
 
 The system is designed to scale to N seesaws with no architectural changes: every seesaw runs the same firmware, only the `SEESAW_ID` differs per flash, and adding a new seesaw on the Pi side is one entry in `config.yaml`.
 
@@ -25,15 +25,19 @@ flowchart LR
             X1[MAX3485<br/>RS485 transceiver]
             L1[74AHCT125<br/>3V3 to 5V buffer]
             B1[MPU6050<br/>accelerometer over I2C]
-            D1a[WS2813 strip A]
-            D1b[WS2813 strip B]
+            D1a1[WS2813 strip A1<br/>SIDE_A pair]
+            D1a2[WS2813 strip A2<br/>SIDE_A pair]
+            D1b1[WS2813 strip B1<br/>SIDE_B pair]
+            D1b2[WS2813 strip B2<br/>SIDE_B pair]
             Buck1 -->|"local 5V"| T1
             Buck1 -->|"local 5V"| L1
-            Buck1 -->|"local 5V"| D1a
-            Buck1 -->|"local 5V"| D1b
+            Buck1 -->|"local 5V"| D1a1
+            Buck1 -->|"local 5V"| D1a2
+            Buck1 -->|"local 5V"| D1b1
+            Buck1 -->|"local 5V"| D1b2
         end
         subgraph SS2 [Seesaw 2 - on the seesaw]
-            Buck2[Buck + Teensy + xcvr + buffer + MPU6050 + 2 strips]
+            Buck2[Buck + Teensy + xcvr + buffer + MPU6050 + 4 strips]
         end
     end
 
@@ -44,8 +48,10 @@ flowchart LR
 
     B1 --> T1
     T1 --> L1
-    L1 --> D1a
-    L1 --> D1b
+    L1 --> D1a1
+    L1 --> D1a2
+    L1 --> D1b1
+    L1 --> D1b2
     T1 <--> X1
     Amp -->|"speaker-level"| Speakers
 ```
@@ -62,16 +68,25 @@ The cable bundle from the rack to each seesaw carries:
 
 - [Firmware/](Firmware/) - Teensy 4.0 firmware. See [Firmware/README.md](Firmware/README.md).
   - [Seesaw/](Firmware/Seesaw/) - Arduino sketch
-  - [tools/csv_to_header.py](Firmware/tools/csv_to_header.py) - converts a chase CSV into `chase.h`
+  - [tools/csv_to_header.py](Firmware/tools/csv_to_header.py) - converts a play or idle CSV into `chase.h` / `idle.h`
 - [Audio/](Audio/) - Pi audio player (Python). See [Audio/README.md](Audio/README.md).
 
 ## Behavior
 
-Whenever the seesaw reverses direction (the moment one side bottoms out and starts coming back up):
+The firmware runs in one of two modes at any time:
+
+- **IDLE** (default at boot, and re-entered automatically after `IDLE_TIMEOUT_MS` (default 60 s) without a tilt event): the idle animation in `idle.h` loops continuously on all four strips, with each strip offset by `IDLE_FRAME_OFFSET_<strip>` frames so they animate phase-shifted (a wave across the seesaw).
+- **PLAY** (entered on the next tilt event): the play chase in `chase.h` runs on the pair of strips on the side that just bottomed out.
+
+When the seesaw reverses direction (the moment one side bottoms out and starts coming back up):
 
 1. The Teensy sends a 6-byte event frame over RS485 announcing `(SEESAW_ID, direction)` - `direction` is whichever side just bottomed out.
-2. The Teensy plays the chase animation on both LED strips simultaneously - **forward** for `SIDE_A`, **reverse** for `SIDE_B`. (One CSV; the playback engine reverses index order for the opposite side.) A new tilt event interrupts the in-progress chase, after a short configurable cooldown so very fast bounces don't re-stomp on the chase.
+2. If the seesaw was in IDLE, it switches to PLAY (and the running idle animation is wiped). The Teensy then plays the chase animation on the **pair of strips that lives on the side that just bottomed out** - the SIDE_A pair runs the chase **forward** on `DIR_A`, the SIDE_B pair runs it in **reverse** on `DIR_B`. The other pair stays dark for the duration of the chase, so the visual feedback localizes to whichever side just hit the ground. The two pins in the active pair receive identical data so the two strips on that side stay in lock-step. A new tilt event interrupts the in-progress chase (and switches which pair is lit if the new event is on the opposite side), after a short configurable cooldown so very fast bounces don't re-stomp on the chase.
 3. The Pi receives the frame, validates the CRC, dedupes against duplicate retransmits, and plays the WAV file mapped to `(seesaw_id, direction)` on a free `pygame.mixer` channel. It does not interrupt sounds already playing.
+
+After `IDLE_TIMEOUT_MS` of no further tilt events, and only once the in-flight chase has finished, the seesaw drops back to IDLE.
+
+The firmware also sends an **`EVT_STATE_*` frame** on every IDLE<->PLAY transition (boot lands in IDLE, the first tilt out of IDLE flips to PLAY, idle timeout drops back to IDLE). On an IDLE -> PLAY transition the state-change event goes out before the tilt event that caused it. The Pi has a no-op listener stub for these (they're logged but not acted on); idle-aware audio behavior - attract music between sessions, ducking, prompts - can be hooked in there later without any firmware change. See [Audio/README.md](Audio/README.md#state-change-events-idleplay) for the wire codes and the listener.
 
 The Pi is a passive listener; seesaws never wait for an ack. Each event is sent twice on the bus with random jitter to mitigate the rare case of two seesaws tilting simultaneously and colliding on the wire.
 
@@ -81,10 +96,10 @@ The Pi is a passive listener; seesaws never wait for an ack. Each event is sent 
 - 1x Teensy 4.0
 - 1x **MPU6050 accelerometer breakout** (e.g. GY-521 module, ~$2-5). Mounted to the seesaw frame with one axis aligned along the seesaw's length.
 - 1x **MAX3485** or **SN65HVD3082** (3.3 V RS485 transceiver - **do not use the 5 V MAX485 with Teensy 4.0**, its 3.3 V GPIO is not 5 V tolerant)
-- 1x 74AHCT125 (or 74HCT245) 5 V level-shifting buffer for the LED data lines
-- 2x WS2813 LED strips (length to taste; same length on both sides)
-- 2x 1000 uF electrolytic caps (one per strip, across V+/GND at the strip start)
-- 2x 330-470 ohm resistors in series with each strip's data line (after the level shifter)
+- 1x 74AHCT125 (or 74HCT245) 5 V level-shifting buffer for the LED data lines (the 74AHCT125 has four channels, exactly enough for the four LED strips)
+- 4x WS2813 LED strips, **45 LEDs each**, two strips per side of the seesaw (`STRIP_NUM_LEDS` in `config.h`; if you change the length, change it on all four strips and update the constant)
+- 4x 1000 uF electrolytic caps (one per strip, across V+/GND at the strip start)
+- 4x 330-470 ohm resistors in series with each strip's data line (after the level shifter)
 - 1x **24V to 5V buck converter** rated for the seesaw's worst-case 5V current with headroom (e.g. Pololu D24V90F5 5A, or a generic "DC-DC 24V to 5V 10A" board for higher LED counts)
 - 1x small **IP65 / IP66 junction box with cable glands** to house the buck converter on or under the seesaw frame
 - 1x 3-5A automotive / inline fuse on the seesaw's 24 V input tap (protects the central trunk if the local buck shorts)
@@ -130,13 +145,17 @@ flowchart LR
         MPU["MPU6050 VCC"]
         Pin18["Teensy pin 18 - I2C SDA"]
         Pin19["Teensy pin 19 - I2C SCL"]
-        Pin8["Teensy pin 8 - LED data 1"]
-        Pin14["Teensy pin 14 - LED data 2"]
+        Pin8["Teensy pin 8 - LED data A1"]
+        Pin14["Teensy pin 14 - LED data A2"]
+        Pin17["Teensy pin 17 - LED data B1"]
+        Pin20["Teensy pin 20 - LED data B2"]
         Pin0["Teensy pin 0 - Serial1 RX"]
         Pin1["Teensy pin 1 - Serial1 TX"]
         Pin6["Teensy pin 6 - DE+RE"]
-        Strip1["WS2813 strip 1<br/>VCC + GND + DIN<br/>1000uF cap, 470 ohm"]
-        Strip2["WS2813 strip 2<br/>VCC + GND + DIN<br/>1000uF cap, 470 ohm"]
+        StripA1["WS2813 strip A1 (SIDE_A)<br/>45 LEDs + 1000uF cap, 470 ohm"]
+        StripA2["WS2813 strip A2 (SIDE_A)<br/>45 LEDs + 1000uF cap, 470 ohm"]
+        StripB1["WS2813 strip B1 (SIDE_B)<br/>45 LEDs + 1000uF cap, 470 ohm"]
+        StripB2["WS2813 strip B2 (SIDE_B)<br/>45 LEDs + 1000uF cap, 470 ohm"]
     end
     BusV --> Fuse --> Buck --> Local5V
     BusG --> Buck
@@ -144,15 +163,19 @@ flowchart LR
     BusG --> MPU
     Local5V --> VIN
     Local5V --> Shifter
-    Local5V --> Strip1
-    Local5V --> Strip2
+    Local5V --> StripA1
+    Local5V --> StripA2
+    Local5V --> StripB1
+    Local5V --> StripB2
     VIN --> V3
     V3 --> XCVR
     V3 --> MPU
     Pin18 <--> MPU
     Pin19 --> MPU
-    Pin8 --> Shifter --> Strip1
-    Pin14 --> Shifter --> Strip2
+    Pin8 --> Shifter --> StripA1
+    Pin14 --> Shifter --> StripA2
+    Pin17 --> Shifter --> StripB1
+    Pin20 --> Shifter --> StripB2
     Pin0 --> XCVR
     Pin1 --> XCVR
     Pin6 --> XCVR
@@ -194,22 +217,39 @@ Why this works for an outdoor / weatherproof installation:
 
 #### Sizing the central 24 V PSU
 
+There are now two distinct lit-strip cases per seesaw, and the buck/PSU has to handle the higher of the two:
+
 ```text
-Per seesaw, 5V side worst case:
-  I_seesaw_5V = LEDs_per_strip * 2 strips * 60 mA
-              ~= 7.2 A for a pair of 60 LED strips
-              ~= 12 A for a pair of 100 LED strips
+PLAY mode: only ONE pair of strips lights at a time (the side that
+just bottomed out), so peak draw is set by ONE pair (2 strips):
+  I_play_5V = LEDs_per_strip * 2 strips * 60 mA
+            ~= 5.4 A for the default 45 LEDs per strip
+            ~= 7.2 A for 60 LEDs per strip
+            ~=  12 A for 100 LEDs per strip
+
+IDLE mode: ALL FOUR strips light continuously with the idle animation.
+Peak depends on the brightness in idle.h - a subtle breath/wave at low
+brightness is much cheaper than a hypothetical "all white" idle frame:
+  I_idle_5V_worst = LEDs_per_strip * 4 strips * 60 mA * (idle_peak / 255)
+                  ~= 2.7 A for the placeholder breath (peak ~64/255 ~= 25%)
+                  ~= 10.8 A for 4 x 45 strips at 100% white in idle
+  Author idle.h with this in mind: subtle slow patterns at moderate
+  brightness draw far less than the play chase.
+
+Per-seesaw 5V side: take the max of the two:
+  I_seesaw_5V = max(I_play_5V, I_idle_5V_worst)
 
 Per seesaw, 24V trunk side (buck efficiency ~90%):
   I_seesaw_24V ~= I_seesaw_5V * 5 / (24 * 0.9)
-               ~= 1.7 A for a pair of 60 LED strips
-               ~= 2.8 A for a pair of 100 LED strips
+               ~= 1.25 A for the default 4 x 45 LED strips, play-bound
+               ~= 1.7  A for 4 x 60 LED strips, play-bound
+               ~= 2.8  A for 4 x 100 LED strips, play-bound
 
 Central PSU: sum across all seesaws and add 30% headroom:
   I_PSU_24V = sum of I_seesaw_24V * 1.3
 ```
 
-Real animations rarely sit at full white, so average draw is much lower than peak - but size the PSU for peak so brief full-white frames don't brown out the rail.
+For the default config (4 x 45 LEDs, placeholder idle, default `LED_BRIGHTNESS = 255`), the play-mode peak (~5.4 A) dominates and the idle peak (~2.7 A) is comfortably under it - so the existing buck recommendations still apply. If you author a brighter idle animation, recompute `I_idle_5V_worst` from your idle.h's peak frame and re-pick the buck if it now exceeds the play case. `LED_BRIGHTNESS` in `config.h` scales both modes uniformly, so dropping it is the easiest way to cap power without re-rendering animations. Real animations rarely sit at full white, so average draw is much lower than peak - but size the PSU for peak so brief full-white frames don't brown out the rail.
 
 #### Sizing the 24 V trunk wire
 
@@ -227,8 +267,8 @@ Rule of thumb: 18 AWG is fine for a single seesaw or two on the trunk; 14 or 16 
 
 Pick a buck whose continuous current rating is at least 1.5x your seesaw's worst-case 5 V draw:
 
-- **Up to ~5 A** (a pair of ~40 LED strips): Pololu D24V90F5 (5 A, ~$15), or any rated "24V→5V 5A" module
-- **5-10 A** (60-100 LEDs per strip): a generic "DC-DC 24V to 5V 10A" board (~$8-12), or a Mean Well DDR-15-5 / DDR-30L-5 DIN-rail module if you want industrial reliability
+- **Up to ~5 A** (default 4 x 45 LED strips, peak from ONE lit pair): Pololu D24V90F5 (5 A, ~$15) is on the edge - bump to a 7.5 A or 10 A module if you push `LED_BRIGHTNESS` to the maximum or stretch the strip length
+- **5-10 A** (4 x 60 to 4 x 100 LED strips, peak from ONE lit pair): a generic "DC-DC 24V to 5V 10A" board (~$8-12), or a Mean Well DDR-15-5 / DDR-30L-5 DIN-rail module if you want industrial reliability
 
 Mount the buck inside a small IP65 cable-gland junction box, with cable glands for the 24 V input wires (from the trunk) and the 5 V output wires (to the seesaw electronics). Heat dissipation on a 5-10 A buck inside a sealed plastic box is mild; if you're at the high end of the current range and the installation runs hot, a metal die-cast box doubles as a heatsink.
 
@@ -242,9 +282,13 @@ Mount the buck inside a small IP65 cable-gland junction box, with cable glands f
 Teensy 4.0 outputs 3.3 V signals; WS2813 wants `VIH >= 3.5 V` when powered from 5 V. The 74AHCT125 buffer (powered from 5 V) takes the Teensy's 3.3 V outputs and produces clean 5 V edges at the strip data input.
 
 ```text
-Teensy pin 8  -> 74AHCT125 input  -> 470 ohm -> Strip 1 DIN   (1000 uF cap V+/GND at strip start)
-Teensy pin 14 -> 74AHCT125 input  -> 470 ohm -> Strip 2 DIN   (1000 uF cap V+/GND at strip start)
+Teensy pin 8  -> 74AHCT125 input  -> 470 ohm -> Strip A1 DIN  (SIDE_A pair, 1000 uF cap at strip start)
+Teensy pin 14 -> 74AHCT125 input  -> 470 ohm -> Strip A2 DIN  (SIDE_A pair, 1000 uF cap at strip start)
+Teensy pin 17 -> 74AHCT125 input  -> 470 ohm -> Strip B1 DIN  (SIDE_B pair, 1000 uF cap at strip start)
+Teensy pin 20 -> 74AHCT125 input  -> 470 ohm -> Strip B2 DIN  (SIDE_B pair, 1000 uF cap at strip start)
 ```
+
+The 74AHCT125 has four buffer channels in one package, so a single chip handles all four LED data lines.
 
 ### RS485 bus
 
@@ -266,15 +310,22 @@ Run a 3-conductor cable between all nodes: A, B, and a GND reference wire. CAT5 
 
 ## Installation workflow
 
-1. **Wire one seesaw** per the diagrams above. Power it up; the strips should be dark.
-2. **Build chase data**. Author the chase animation in your tool of choice and export to CSV (one row per frame, R,G,B,R,G,B,... per LED, 0..255). Convert to a header:
+1. **Wire one seesaw** per the diagrams above. Power it up; the placeholder idle breath animation should run on all four strips immediately (boot lands directly in IDLE mode).
+2. **Build animation data**. Author each animation in your tool of choice and export to CSV (one row per frame, R,G,B,R,G,B,... per LED, 0..255). Convert to headers:
    ```bash
+   # Play chase -> Firmware/Seesaw/chase.h
    python Firmware/tools/csv_to_header.py path/to/chase.csv
+
+   # Idle animation -> Firmware/Seesaw/idle.h
+   python Firmware/tools/csv_to_header.py path/to/idle.csv --target idle
    ```
-   This overwrites `Firmware/Seesaw/chase.h`.
 3. **Set the seesaw's ID** by editing `#define SEESAW_ID 1` in `Firmware/Seesaw/config.h`. Use `1` for the first seesaw, `2` for the second, etc.
 4. **Flash** with the Arduino IDE + Teensyduino. See [Firmware/README.md](Firmware/README.md) for details.
-5. **Tilt the seesaw** - both strips should run the chase forward. Tilt the other way - same chase, in reverse.
+5. **Verify both modes:**
+   - **Idle**: at power-up, all four strips run the idle animation phase-shifted (a wave across the seesaw) and loop forever until you touch it.
+   - **Play (Side A)**: tilt the seesaw so Side A bottoms out. The SIDE_A pair (both strips on Side A, in lock-step) runs the play chase forward; the SIDE_B pair stays dark.
+   - **Play (Side B)**: tilt the other way. The SIDE_B pair runs the same chase in reverse and the SIDE_A pair goes dark.
+   - **Idle return**: leave the seesaw alone for `IDLE_TIMEOUT_MS` (default 60 s). The idle animation should resume on all four strips.
 6. **Repeat** steps 3-5 for each seesaw, incrementing the ID each time.
 7. **Set up the Pi**: install the audio player and copy in your sound assets. See [Audio/README.md](Audio/README.md). Map every `(seesaw_id, direction)` to a WAV file in `Audio/config.yaml`.
 8. **Wire the bus** with termination at both ends and biasing at the Pi end. Connect the USB-to-RS485 adapter to the Pi.
@@ -282,14 +333,18 @@ Run a 3-conductor cable between all nodes: A, B, and a GND reference wire. CAT5 
 
 ## Sub-READMEs
 
-- [Firmware/README.md](Firmware/README.md) - Teensyduino setup, library install, pin map, chase paste workflow, tuning constants, troubleshooting.
+- [Firmware/README.md](Firmware/README.md) - Teensyduino setup, library install, pin map, idle/play state machine, animation paste workflow, tuning constants, troubleshooting.
 - [Audio/README.md](Audio/README.md) - Pi setup, USB-RS485 adapter, Python venv, `config.yaml` schema, running manually vs systemd, troubleshooting.
 
 ## Defaults
 
 | Setting | Default | Where to change |
 |---|---|---|
-| Frame rate | 30 FPS | `CHASE_FPS` in `Firmware/Seesaw/config.h` |
+| Strip length | 45 LEDs | `STRIP_NUM_LEDS` in `Firmware/Seesaw/config.h` |
+| Play frame rate | 30 FPS | `CHASE_FPS` in `Firmware/Seesaw/config.h` |
+| Idle frame rate | 15 FPS | `IDLE_FPS` in `Firmware/Seesaw/config.h` |
+| Idle timeout | 60 s | `IDLE_TIMEOUT_MS` in `Firmware/Seesaw/config.h` |
+| Idle per-strip offsets | 0, N/4, N/2, 3N/4 of `IDLE_NUM_FRAMES` | `IDLE_FRAME_OFFSET_A1/A2/B1/B2` in `Firmware/Seesaw/config.h` |
 | Tilt detection | Gyro reversal | `Firmware/Seesaw/config.h` (gyro axis, sign, velocity threshold) |
 | Min motion velocity | 15 deg/s | `TILT_MIN_VELOCITY_DPS` in `Firmware/Seesaw/config.h` |
 | Event cooldown | 150 ms | `TILT_EVENT_COOLDOWN_MS` in `Firmware/Seesaw/config.h` |

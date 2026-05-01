@@ -10,9 +10,25 @@ Wire protocol (must match Firmware/Seesaw/protocol.h):
     byte 0 : 0xAA          start-of-frame 1
     byte 1 : 0x55          start-of-frame 2
     byte 2 : id            seesaw id (1..255)
-    byte 3 : direction     0 = SIDE_A, 1 = SIDE_B
+    byte 3 : event         event code (see below)
     byte 4 : seq           rolling counter
     byte 5 : crc8          CRC-8 (poly 0x07) over bytes 2..4
+
+Event codes (byte 3):
+
+    Tilt events - drive audio playback:
+        EVT_TILT_A       (0)   SIDE_A bottomed out
+        EVT_TILT_B       (1)   SIDE_B bottomed out
+
+    State-change events - the seesaw's mode just changed:
+        EVT_STATE_IDLE   (2)   entered IDLE (boot, or PLAY -> IDLE timeout)
+        EVT_STATE_PLAY   (3)   entered PLAY (first tilt out of IDLE)
+
+The firmware emits state-change events on every IDLE<->PLAY transition.
+This player has a listener stub for them (see SeesawAudio.on_state_change)
+that currently does nothing - the wire path is in place so idle-aware
+audio behavior (attract music, prompts, etc.) can be added later
+without another firmware change.
 """
 
 from __future__ import annotations
@@ -37,7 +53,26 @@ FRAME_SOF1 = 0xAA
 FRAME_SOF2 = 0x55
 FRAME_SIZE = 6
 
-DIR_NAMES = {0: "A", 1: "B"}
+# Event codes carried in byte 3 of the frame. Must match
+# Firmware/Seesaw/protocol.h.
+EVT_TILT_A = 0
+EVT_TILT_B = 1
+EVT_STATE_IDLE = 2
+EVT_STATE_PLAY = 3
+
+TILT_EVENTS = (EVT_TILT_A, EVT_TILT_B)
+STATE_EVENTS = (EVT_STATE_IDLE, EVT_STATE_PLAY)
+
+# Single-letter labels used by the sounds config / play() logging.
+DIR_NAMES = {EVT_TILT_A: "A", EVT_TILT_B: "B"}
+
+# Long names for general event logging (state events included).
+EVENT_NAMES = {
+    EVT_TILT_A: "TILT_A",
+    EVT_TILT_B: "TILT_B",
+    EVT_STATE_IDLE: "STATE_IDLE",
+    EVT_STATE_PLAY: "STATE_PLAY",
+}
 
 
 def crc8(data: bytes) -> int:
@@ -55,7 +90,7 @@ def crc8(data: bytes) -> int:
 
 class FrameReader(threading.Thread):
     """Background thread: reads bytes from the serial port and emits
-    validated (id, direction, seq) tuples onto a queue."""
+    validated (id, event, seq) tuples onto a queue."""
 
     def __init__(
         self,
@@ -103,7 +138,7 @@ class FrameReader(threading.Thread):
                 return
 
             sid = buf[2]
-            direction = buf[3]
+            event = buf[3]
             seq = buf[4]
             recv_crc = buf[5]
             calc_crc = crc8(bytes(buf[2:5]))
@@ -117,7 +152,7 @@ class FrameReader(threading.Thread):
                 del buf[0]
                 continue
             del buf[:FRAME_SIZE]
-            self.queue.put((sid, direction, seq))
+            self.queue.put((sid, event, seq))
 
 
 class SeesawAudio:
@@ -224,6 +259,25 @@ class SeesawAudio:
         channel.play(sound)
         LOG.info("Playing seesaw %d %s", sid, label)
 
+    def on_state_change(self, sid: int, event: int, seq: int) -> None:
+        """Listener stub for IDLE<->PLAY state-change events from a seesaw.
+
+        The firmware emits EVT_STATE_IDLE when a seesaw enters its idle
+        animation (on boot, or after IDLE_TIMEOUT_MS without a tilt) and
+        EVT_STATE_PLAY when it transitions to play (the first tilt out
+        of idle). Each event is sent on RS485 like a regular tilt frame
+        and is delivered to this method after dedupe.
+
+        This is intentionally a no-op placeholder today - it just logs
+        the event so you can verify on the bench that state changes
+        reach the Pi. Hook idle-aware audio behavior (attract music,
+        prompts, ducking, ...) in here when you're ready; the firmware
+        already emits the events, no firmware change needed to start
+        acting on them.
+        """
+        name = EVENT_NAMES.get(event, f"0x{event:02X}")
+        LOG.info("State change: seesaw %d -> %s (seq %d)", sid, name, seq)
+
     def run(self) -> int:
         self.init_audio()
         self.load_sounds()
@@ -244,7 +298,7 @@ class SeesawAudio:
         try:
             while not self._stop_event.is_set():
                 try:
-                    sid, direction, seq = self._queue.get(timeout=0.2)
+                    sid, event, seq = self._queue.get(timeout=0.2)
                 except queue.Empty:
                     continue
                 key = (sid, seq)
@@ -252,7 +306,17 @@ class SeesawAudio:
                     LOG.debug("Dedup seesaw %d seq %d", sid, seq)
                     continue
                 self._dedupe.append(key)
-                self.play(sid, direction)
+                if event in TILT_EVENTS:
+                    self.play(sid, event)
+                elif event in STATE_EVENTS:
+                    self.on_state_change(sid, event, seq)
+                else:
+                    LOG.warning(
+                        "Unknown event code 0x%02X from seesaw %d (seq %d)",
+                        event,
+                        sid,
+                        seq,
+                    )
         finally:
             self._stop_event.set()
             if self._port is not None:

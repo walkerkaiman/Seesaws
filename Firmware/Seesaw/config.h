@@ -12,8 +12,50 @@
 // Unique 1..255 identifier for this seesaw.
 #define SEESAW_ID 1
 
-// Animation frame rate (frames per second).
+// Number of LEDs on each WS2813 strip. This is a *hardware* property -
+// all four physical strips on the seesaw must be this length. The chase
+// data in chase.h has its own width (CHASE_NUM_LEDS, auto-derived by
+// csv_to_header.py from the source CSV); it must be <= STRIP_NUM_LEDS.
+// Any LEDs past CHASE_NUM_LEDS are written black on every clear and
+// otherwise left untouched, so they stay dark.
+#define STRIP_NUM_LEDS 45
+
+// Animation frame rate for the play-mode chase (frames per second).
 #define CHASE_FPS 30
+
+// ---- Idle / Play state machine -------------------------------------
+//
+// The seesaw runs in one of two modes at any time:
+//   - PLAY: triggered by a tilt event; runs the chase in chase.h on
+//     the pair of strips on the side that just bottomed out.
+//   - IDLE: continuously loops the idle animation in idle.h on all
+//     four strips with a per-strip frame offset, so the four strips
+//     animate phase-shifted.
+//
+// Boot starts in IDLE so the seesaw shows the idle animation
+// immediately on power-up. After IDLE_TIMEOUT_MS without a tilt event,
+// the firmware drops back from PLAY to IDLE; a tilt while idle
+// instantly returns it to PLAY.
+
+// Time (ms) without a tilt event before reverting from PLAY to IDLE.
+// Default 60000 ms = 60 seconds.
+#define IDLE_TIMEOUT_MS  60000
+
+// Idle animation frame rate (frames per second). Independent of
+// CHASE_FPS so you can have a slow breathing idle and a fast play
+// chase, or vice versa.
+#define IDLE_FPS         15
+
+// Per-strip frame offsets for the idle animation. Each strip displays
+// the idle chase but shifted by this many frames (modulo IDLE_NUM_FRAMES
+// from idle.h), creating a phase-shifted wave across the four strips.
+// The defaults divide the cycle into quarters between A1, A2, B1, B2;
+// override here if you want a different idle pattern (e.g. set both
+// pins on a side to the same offset to keep the pair in lock-step).
+#define IDLE_FRAME_OFFSET_A1  0
+#define IDLE_FRAME_OFFSET_A2  ((IDLE_NUM_FRAMES * 1) / 4)
+#define IDLE_FRAME_OFFSET_B1  ((IDLE_NUM_FRAMES * 2) / 4)
+#define IDLE_FRAME_OFFSET_B2  ((IDLE_NUM_FRAMES * 3) / 4)
 
 // Global LED brightness scaler, 0..255. Every R/G/B value coming out of
 // the chase data is multiplied by (LED_BRIGHTNESS / 255) before being
@@ -27,22 +69,29 @@
 
 // ---- Pin assignments (Teensy 4.0) -----------------------------------
 //
-//   I2C_SDA / I2C_SCL  - MPU6050 accelerometer over the default Wire bus.
-//                        Teensy 4.0 Wire = pin 18 (SDA) / pin 19 (SCL).
-//                        Module already has built-in 4.7k pull-ups, so no
-//                        external resistors needed.
-//   PIN_LED_STRIP_1/2  - WS2812Serial-supported TX pins. Both strips are
-//                        driven with the same data simultaneously. Routed
-//                        through a 74AHCT125 (5V) buffer before reaching
-//                        the strips.
-//                        Valid Teensy 4.0 pins: 1 (Serial1, taken by RS485),
-//                        8 (Serial2), 14 (Serial3), 17 (Serial4), 20 (Serial5),
-//                        24 (Serial6), 29 (Serial7), 39 (Serial8).
-//   PIN_RS485_DE       - Tied to MAX3485 DE+RE; toggled automatically by
-//                        Serial1.transmitterEnable().
-#define PIN_LED_STRIP_1   8
-#define PIN_LED_STRIP_2   14
-#define PIN_RS485_DE      6
+//   I2C_SDA / I2C_SCL    - MPU6050 accelerometer over the default Wire bus.
+//                          Teensy 4.0 Wire = pin 18 (SDA) / pin 19 (SCL).
+//                          Module already has built-in 4.7k pull-ups, so no
+//                          external resistors needed.
+//   PIN_LED_STRIP_A1/A2  - SIDE_A LED strip pair. Both pins receive the
+//   PIN_LED_STRIP_B1/B2    same frame data as their side mate; only one
+//                          pair lights at a time. A DIR_A event runs the
+//                          chase forward on the SIDE_A pair (B pair stays
+//                          dark); a DIR_B event runs it in reverse on the
+//                          SIDE_B pair (A pair stays dark). Each pin is
+//                          routed through a 74AHCT125 (5V) buffer before
+//                          reaching its strip.
+//                          Valid Teensy 4.0 WS2812Serial pins: 1 (Serial1,
+//                          taken by RS485), 8 (Serial2), 14 (Serial3),
+//                          17 (Serial4), 20 (Serial5), 24 (Serial6),
+//                          29 (Serial7), 39 (Serial8).
+//   PIN_RS485_DE         - Tied to MAX3485 DE+RE; toggled automatically by
+//                          Serial1.transmitterEnable().
+#define PIN_LED_STRIP_A1   8
+#define PIN_LED_STRIP_A2  14
+#define PIN_LED_STRIP_B1  17
+#define PIN_LED_STRIP_B2  20
+#define PIN_RS485_DE       6
 
 // ---- RS485 ----------------------------------------------------------
 #define RS485_BAUD        115200

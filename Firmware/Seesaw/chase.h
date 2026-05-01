@@ -5,9 +5,13 @@
 // CHASE DATA
 // =====================================================================
 //
-// The chase animation, played simultaneously on both LED strips on the
-// seesaw. SIDE_A plays frame 0 -> CHASE_NUM_FRAMES-1; SIDE_B plays the
-// same data in reverse (CHASE_NUM_FRAMES-1 -> 0).
+// The chase animation. The firmware lights only the pair of strips on
+// the side that just bottomed out: a DIR_A event plays this data
+// forward (frame 0 -> CHASE_NUM_FRAMES-1) on the SIDE_A pair; a DIR_B
+// event plays it in reverse (CHASE_NUM_FRAMES-1 -> 0) on the SIDE_B
+// pair. The other pair stays dark for that chase. Both pins inside the
+// active pair receive identical pixel data so the two strips on that
+// side animate in lock-step.
 //
 // Format: one row per animation frame, CHASE_NUM_LEDS triplets per row,
 // in R,G,B order, values 0..255.

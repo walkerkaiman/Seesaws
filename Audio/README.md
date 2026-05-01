@@ -2,6 +2,8 @@
 
 Polyphonic audio player that listens on RS485 for events from the seesaws and plays the sound mapped to each `(seesaw_id, direction)`. New events never cut off in-flight sounds. Adding a seesaw is one entry in `config.yaml` - no code changes.
 
+The seesaws also emit IDLE/PLAY state-change events on every transition. The player has a [listener stub](#state-change-events-idleplay) for them today (they're logged but not acted on); idle-aware audio behavior can be hooked in there later without any firmware change.
+
 See the [root README](../README.md) for system architecture and wiring.
 
 ## Layout
@@ -128,6 +130,41 @@ Rules:
 - **Avoid clicks**: ensure the WAV starts and ends at zero crossings. Many DAWs have a "fade-in/out 5 ms" macro for this.
 - **Normalize** all sounds to roughly the same loudness to avoid surprises during installation tuning.
 
+## State-change events (IDLE/PLAY)
+
+The seesaws send two kinds of frames over RS485:
+
+| Byte 3 | Constant | Source | Handler |
+|---|---|---|---|
+| 0 | `EVT_TILT_A` (= `DIR_A`) | tilt: SIDE_A bottomed out | `play()` |
+| 1 | `EVT_TILT_B` (= `DIR_B`) | tilt: SIDE_B bottomed out | `play()` |
+| 2 | `EVT_STATE_IDLE` | seesaw entered IDLE | `on_state_change()` (stub) |
+| 3 | `EVT_STATE_PLAY` | seesaw entered PLAY | `on_state_change()` (stub) |
+
+Tilt events drive sound playback (existing behavior). State-change events are emitted by the firmware on every IDLE<->PLAY transition - boot lands in IDLE, the first tilt out of IDLE flips to PLAY, and after `IDLE_TIMEOUT_MS` (default 60 s) without activity the seesaw drops back to IDLE.
+
+The player currently has a no-op listener for state events:
+
+```python
+def on_state_change(self, sid: int, event: int, seq: int) -> None:
+    name = EVENT_NAMES.get(event, f"0x{event:02X}")
+    LOG.info("State change: seesaw %d -> %s (seq %d)", sid, name, seq)
+```
+
+It just logs at INFO level so you can see state changes scroll by while you bench-test the firmware:
+
+```
+State change: seesaw 1 -> STATE_IDLE (seq 0)
+State change: seesaw 1 -> STATE_PLAY (seq 17)
+Playing seesaw 1 A
+...
+State change: seesaw 1 -> STATE_IDLE (seq 42)
+```
+
+When you want the audio side to actually react to idle/play (attract music between sessions, ducking, etc.), edit `on_state_change` in `seesaw_audio.py`. The dispatcher in `run()` already routes `EVT_STATE_*` to it; the firmware already emits the events. No firmware change needed.
+
+There is no per-seesaw config for state events - the listener is global. If you later want different idle behavior per seesaw, key on `sid` inside `on_state_change`.
+
 ## Running manually (recommended for first start)
 
 ```bash
@@ -179,4 +216,5 @@ journalctl -u seesaw-audio.service -f
 - **`No free channel`** -> raise `audio.channels` (try 64). Means more sounds were overlapping than the mixer was configured for.
 - **`CRC mismatch` warnings** -> bus integrity issue. Usual suspects: missing termination at one end, missing bias resistors, swapped A/B somewhere, or `serial.baud` not matching the firmware's `RS485_BAUD`.
 - **Garbled output / `No sound mapped for seesaw N direction X` for an N you didn't plan for** -> typically random noise on a poorly-terminated bus passing CRC by chance. Fix bus wiring and the spurious events stop.
+- **`Unknown event code 0x..` warnings** -> same root cause as garbled CRC-passing noise above. The firmware only ever sends event codes 0..3; anything else on a bench setup means bus integrity is the problem, not the firmware.
 - **Latency feels high** -> reduce `audio.buffer` (256 or 128). Trade-off: smaller buffers underrun more easily on a busy Pi.

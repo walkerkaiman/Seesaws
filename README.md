@@ -1,21 +1,21 @@
 # Seesaws
 
-Distributed control system for an interactive seesaw installation. Each seesaw has a **Teensy 4.0** that detects rocking with an **MPU6050** (firing events on direction reversal so triggers feel responsive at any amplitude - small kids and adults both register at the impact moment), plays a directional LED chase on the pair of WS2813 strips that lives on whichever side just bottomed out (four strips total, 45 LEDs each, two per side; only the triggered side lights up at a time), and broadcasts the event over an **RS485** bus to a central **Raspberry Pi** that plays a sound. Sounds are polyphonic - they overlap freely instead of cutting each other off.
+Distributed control system for an interactive seesaw installation. Each seesaw has a **Teensy 4.0** that detects rocking with an **MPU6050** (firing events on direction reversal so triggers feel responsive at any amplitude - small kids and adults both register at the impact moment), plays a directional LED chase on the pair of WS2813 strips that lives on whichever side just bottomed out (four strips total, 45 LEDs each, two per side; only the triggered side lights up at a time), and broadcasts the event over an **RS485** bus to a central **Teensy 3.2 with Audio Shield** that plays a sound from SD. Sounds are polyphonic - they overlap freely instead of cutting each other off.
 
-The system is designed to scale to N seesaws with no architectural changes: every seesaw runs the same firmware, only the `SEESAW_ID` differs per flash, and adding a new seesaw on the Pi side is one entry in `config.yaml`.
+The system is designed to scale to N seesaws with no architectural changes: every seesaw runs the same firmware, only the `SEESAW_ID` differs per flash, and adding audio for a new seesaw is two WAV files on the SD card named `{id}_A.wav` and `{id}_B.wav`.
 
 ## Physical layout - what lives where
 
 ```mermaid
 flowchart LR
     subgraph Central [Central weatherproof box - mains AC]
-        Pi[Raspberry Pi]
-        Adapter[USB to RS485 adapter]
+        TAudio[Teensy 3.2 + Audio Shield]
+        XCVR[MAX3485 on Serial1]
         TermBias[Bias + termination resistors]
-        Amp[Audio amplifier]
+        Amp[Audio amplifier optional]
         PSU24[24V central PSU<br/>sized for whole installation]
-        Pi --- Adapter --- TermBias
-        Pi -->|"line-out / USB DAC"| Amp
+        TAudio --- XCVR --- TermBias
+        TAudio -->|"line-out"| Amp
     end
 
     subgraph Field [Outdoor / installation area]
@@ -56,7 +56,7 @@ flowchart LR
     Amp -->|"speaker-level"| Speakers
 ```
 
-Everything that's hard to weatherproof - the Pi, the amp, the big mains-fed PSU - stays inside the central weatherproof rack box. The only things outside that box are: the seesaws themselves, a tiny 24 V → 5 V buck converter inside a small IP65 junction box bolted to each seesaw, and the cable bundle running between them.
+Everything that's hard to weatherproof - the central audio Teensy, the amp (if used), the big mains-fed PSU - stays inside the central weatherproof rack box. The only things outside that box are: the seesaws themselves, a tiny 24 V → 5 V buck converter inside a small IP65 junction box bolted to each seesaw, and the cable bundle running between them.
 
 The cable bundle from the rack to each seesaw carries:
 
@@ -69,7 +69,7 @@ The cable bundle from the rack to each seesaw carries:
 - [Firmware/](Firmware/) - Teensy 4.0 firmware. See [Firmware/README.md](Firmware/README.md).
   - [Seesaw/](Firmware/Seesaw/) - Arduino sketch
   - [tools/csv_to_header.py](Firmware/tools/csv_to_header.py) - converts a play or idle CSV into `chase.h` / `idle.h`
-- [Audio/](Audio/) - Pi audio player (Python). See [Audio/README.md](Audio/README.md).
+- [Audio/](Audio/) - Central audio node (Teensy 3.2 + Audio Shield). See [Audio/README.md](Audio/README.md).
 
 ## Behavior
 
@@ -82,13 +82,13 @@ When the seesaw reverses direction (the moment one side bottoms out and starts c
 
 1. The Teensy sends a 6-byte event frame over RS485 announcing `(SEESAW_ID, direction)` - `direction` is whichever side just bottomed out.
 2. If the seesaw was in IDLE, it switches to PLAY (and the running idle animation is wiped). The Teensy then plays the chase animation on the **pair of strips that lives on the side that just bottomed out** - the SIDE_A pair runs the chase **forward** on `DIR_A`, the SIDE_B pair runs it in **reverse** on `DIR_B`. The other pair stays dark for the duration of the chase, so the visual feedback localizes to whichever side just hit the ground. The two pins in the active pair receive identical data so the two strips on that side stay in lock-step. A new tilt event interrupts the in-progress chase (and switches which pair is lit if the new event is on the opposite side), after a short configurable cooldown so very fast bounces don't re-stomp on the chase.
-3. The Pi receives the frame, validates the CRC, dedupes against duplicate retransmits, and plays the WAV file mapped to `(seesaw_id, direction)` on a free `pygame.mixer` channel. It does not interrupt sounds already playing.
+3. The central audio Teensy receives the frame, validates the CRC, dedupes against duplicate retransmits, and plays `sounds/{seesaw_id}_A.wav` or `sounds/{seesaw_id}_B.wav` from the Audio Shield SD card on a free mixer voice. It does not interrupt sounds already playing.
 
 After `IDLE_TIMEOUT_MS` of no further tilt events, and only once the in-flight chase has finished, the seesaw drops back to IDLE.
 
-The firmware also sends an **`EVT_STATE_*` frame** on every IDLE<->PLAY transition (boot lands in IDLE, the first tilt out of IDLE flips to PLAY, idle timeout drops back to IDLE). On an IDLE -> PLAY transition the state-change event goes out before the tilt event that caused it. The Pi has a no-op listener stub for these (they're logged but not acted on); idle-aware audio behavior - attract music between sessions, ducking, prompts - can be hooked in there later without any firmware change. See [Audio/README.md](Audio/README.md#state-change-events-idleplay) for the wire codes and the listener.
+The firmware also sends an **`EVT_STATE_*` frame** on every IDLE<->PLAY transition (boot lands in IDLE, the first tilt out of IDLE flips to PLAY, idle timeout drops back to IDLE). On an IDLE -> PLAY transition the state-change event goes out before the tilt event that caused it. The audio Teensy has a no-op listener stub for these (USB Serial log only today); idle-aware audio behavior can be hooked in there later without any seesaw firmware change. See [Audio/README.md](Audio/README.md#state-change-events-idleplay).
 
-The Pi is a passive listener; seesaws never wait for an ack. Each event is sent twice on the bus with random jitter to mitigate the rare case of two seesaws tilting simultaneously and colliding on the wire.
+The audio node is a passive listener; seesaws never wait for an ack. Each event is sent twice on the bus with random jitter to mitigate the rare case of two seesaws tilting simultaneously and colliding on the wire.
 
 ## Hardware bill of materials
 
@@ -106,11 +106,11 @@ The Pi is a passive listener; seesaws never wait for an ack. Each event is sent 
 
 ### Central weatherproof rack box (one per installation)
 - 1x **24 V central PSU** sized to the *whole installation's* worst-case load (sizing below). Examples: Mean Well **LRS-150-24** (6.5 A) for small installs, **LRS-350-24** (14.6 A) for larger
-- 1x Raspberry Pi
-- 1x USB-to-RS485 adapter (any common CH340/FT232+MAX485 dongle works)
+- 1x **Teensy 3.2** + **PJRC Audio Shield** (SD card for WAV storage, line-out to amp)
+- 1x **MAX3485** or **SN65HVD3082** on the audio Teensy's Serial1 (same wiring as on the seesaws)
 - 1x 120 ohm termination resistor across A-B (this is one of the two bus terminations)
 - 2x 680 ohm bias resistors at this end of the bus, one to 3V3 and one to GND
-- 1x audio amplifier driven from the Pi's line-out or a USB DAC, sized to your speakers (e.g. TPA3116 / MAX9744 class-D for passive bookshelf speakers, or skip the amp entirely and use powered / PA speakers)
+- 1x audio amplifier driven from the Audio Shield line-out, sized to your speakers (e.g. TPA3116 / MAX9744 class-D for passive bookshelf speakers, or skip the amp and use powered / PA speakers)
 - 1x set of speakers (separate from the rack box; speaker cables exit the box)
 - 1x mains inlet / fused breaker for the rack box
 
@@ -145,13 +145,13 @@ flowchart LR
         MPU["MPU6050 VCC"]
         Pin18["Teensy pin 18 - I2C SDA"]
         Pin19["Teensy pin 19 - I2C SCL"]
-        Pin8["Teensy pin 8 - LED data A1"]
-        Pin14["Teensy pin 14 - LED data A2"]
-        Pin17["Teensy pin 17 - LED data B1"]
-        Pin20["Teensy pin 20 - LED data B2"]
+        Pin6["Teensy pin 6 - LED data A1"]
+        Pin7["Teensy pin 7 - LED data A2"]
+        Pin8["Teensy pin 8 - LED data B1"]
+        Pin9["Teensy pin 9 - LED data B2"]
         Pin0["Teensy pin 0 - Serial1 RX"]
         Pin1["Teensy pin 1 - Serial1 TX"]
-        Pin6["Teensy pin 6 - DE+RE"]
+        Pin2["Teensy pin 2 - DE+RE"]
         StripA1["WS2813 strip A1 (SIDE_A)<br/>45 LEDs + 1000uF cap, 470 ohm"]
         StripA2["WS2813 strip A2 (SIDE_A)<br/>45 LEDs + 1000uF cap, 470 ohm"]
         StripB1["WS2813 strip B1 (SIDE_B)<br/>45 LEDs + 1000uF cap, 470 ohm"]
@@ -172,13 +172,13 @@ flowchart LR
     V3 --> MPU
     Pin18 <--> MPU
     Pin19 --> MPU
-    Pin8 --> Shifter --> StripA1
-    Pin14 --> Shifter --> StripA2
-    Pin17 --> Shifter --> StripB1
-    Pin20 --> Shifter --> StripB2
+    Pin6 --> Shifter --> StripA1
+    Pin7 --> Shifter --> StripA2
+    Pin8 --> Shifter --> StripB1
+    Pin9 --> Shifter --> StripB2
     Pin0 --> XCVR
     Pin1 --> XCVR
-    Pin6 --> XCVR
+    Pin2 --> XCVR
     XCVR --> RA
     XCVR --> RB
 ```
@@ -192,7 +192,7 @@ Notes:
 
 ### Power topology
 
-A single 24 V central PSU lives in the same weatherproof rack box as the Pi and the amp. A thin two-conductor `+24V` / `GND` trunk runs out to each seesaw alongside the RS485 cable. At each seesaw, a small buck converter (mounted in its own little IP65 junction box) regenerates clean local 5 V for the strips, level shifter, and Teensy.
+A single 24 V central PSU lives in the same weatherproof rack box as the audio Teensy and the amp. A thin two-conductor `+24V` / `GND` trunk runs out to each seesaw alongside the RS485 cable. At each seesaw, a small buck converter (mounted in its own little IP65 junction box) regenerates clean local 5 V for the strips, level shifter, and Teensy.
 
 ```mermaid
 flowchart LR
@@ -211,7 +211,7 @@ flowchart LR
 
 Why this works for an outdoor / weatherproof installation:
 
-- **Everything mains-fed stays in the central rack box.** The big PSU, the Pi, the amp - all the items that are hardest to weatherproof and most expensive to replace - share one IP-rated enclosure.
+- **Everything mains-fed stays in the central rack box.** The big PSU, the audio Teensy, the amp - all the items that are hardest to weatherproof and most expensive to replace - share one IP-rated enclosure.
 - **The long run is low-current 24 V DC.** At 24 V, even 4 seesaws drawing peak current pull just ~6 A on the trunk; voltage drop over 20 ft of 18 AWG is ~6%, which the buck input range absorbs trivially. There is no risk of WS2813 brown-out from trunk voltage drop, because the strips never see the trunk - they see the buck's regulated 5 V output.
 - **Per-seesaw bucks are easy to weatherproof.** A 24V→5V module is small (often credit-card-sized or smaller). It fits inside a $5 IP65 cable-gland junction box bolted under the seesaw. The buck is the only "wet" electronics outside the rack.
 
@@ -282,10 +282,10 @@ Mount the buck inside a small IP65 cable-gland junction box, with cable glands f
 Teensy 4.0 outputs 3.3 V signals; WS2813 wants `VIH >= 3.5 V` when powered from 5 V. The 74AHCT125 buffer (powered from 5 V) takes the Teensy's 3.3 V outputs and produces clean 5 V edges at the strip data input.
 
 ```text
-Teensy pin 8  -> 74AHCT125 input  -> 470 ohm -> Strip A1 DIN  (SIDE_A pair, 1000 uF cap at strip start)
-Teensy pin 14 -> 74AHCT125 input  -> 470 ohm -> Strip A2 DIN  (SIDE_A pair, 1000 uF cap at strip start)
-Teensy pin 17 -> 74AHCT125 input  -> 470 ohm -> Strip B1 DIN  (SIDE_B pair, 1000 uF cap at strip start)
-Teensy pin 20 -> 74AHCT125 input  -> 470 ohm -> Strip B2 DIN  (SIDE_B pair, 1000 uF cap at strip start)
+Teensy pin 6  -> 74AHCT125 input  -> 470 ohm -> Strip A1 DIN  (SIDE_A pair, 1000 uF cap at strip start)
+Teensy pin 7  -> 74AHCT125 input  -> 470 ohm -> Strip A2 DIN  (SIDE_A pair, 1000 uF cap at strip start)
+Teensy pin 8  -> 74AHCT125 input  -> 470 ohm -> Strip B1 DIN  (SIDE_B pair, 1000 uF cap at strip start)
+Teensy pin 9  -> 74AHCT125 input  -> 470 ohm -> Strip B2 DIN  (SIDE_B pair, 1000 uF cap at strip start)
 ```
 
 The 74AHCT125 has four buffer channels in one package, so a single chip handles all four LED data lines.
@@ -295,15 +295,15 @@ The 74AHCT125 has four buffer channels in one package, so a single chip handles 
 Run a 3-conductor cable between all nodes: A, B, and a GND reference wire. CAT5 with one twisted pair for A/B and one conductor for GND works perfectly.
 
 - **Termination**: 120 ohm across A-B at both physical ends of the bus only.
-- **Biasing**: ~680 ohm A-to-3V3 and ~680 ohm B-to-GND at exactly one node (usually the Pi end).
+- **Biasing**: ~680 ohm A-to-3V3 and ~680 ohm B-to-GND at exactly one node (the rack / audio Teensy end).
 - **Ground reference**: the GND wire in the RS485 cable should tie to the cluster's 5V GND rail, so all transceivers share a common reference.
-- **Adapter**: a USB-to-RS485 dongle on the Pi avoids the Pi's 3.3 V GPIO mismatch and Bluetooth UART contention. Recommended.
+- **Central node**: the audio Teensy listens on Serial1 through a MAX3485, same pinout as the seesaw firmware (RX=0, TX=1, DE+RE=2).
 - **Transceiver wiring** (each Teensy):
   - MAX3485 VCC -> Teensy 3V3
   - MAX3485 GND -> common ground (cluster GND rail)
   - MAX3485 RO  -> Teensy pin 0 (Serial1 RX)
   - MAX3485 DI  -> Teensy pin 1 (Serial1 TX)
-  - MAX3485 DE+RE tied together -> Teensy pin 6 (`PIN_RS485_DE`)
+  - MAX3485 DE+RE tied together -> Teensy pin 2 (`PIN_RS485_DE`)
   - MAX3485 A/B -> bus A/B
 
 `Serial1.transmitterEnable(PIN_RS485_DE)` toggles the DE/RE pin around every transmission automatically.
@@ -327,14 +327,14 @@ Run a 3-conductor cable between all nodes: A, B, and a GND reference wire. CAT5 
    - **Play (Side B)**: tilt the other way. The SIDE_B pair runs the same chase in reverse and the SIDE_A pair goes dark.
    - **Idle return**: leave the seesaw alone for `IDLE_TIMEOUT_MS` (default 60 s). The idle animation should resume on all four strips.
 6. **Repeat** steps 3-5 for each seesaw, incrementing the ID each time.
-7. **Set up the Pi**: install the audio player and copy in your sound assets. See [Audio/README.md](Audio/README.md). Map every `(seesaw_id, direction)` to a WAV file in `Audio/config.yaml`.
-8. **Wire the bus** with termination at both ends and biasing at the Pi end. Connect the USB-to-RS485 adapter to the Pi.
-9. **Start the audio player** (manually first, then enable the systemd service for autostart on boot).
+7. **Set up the audio Teensy**: flash [Audio/SeesawAudio](Audio/SeesawAudio), copy `Audio/sounds/` onto the SD card as `sounds/{id}_A.wav` and `sounds/{id}_B.wav`. See [Audio/README.md](Audio/README.md).
+8. **Wire the bus** with termination at both ends and biasing at the rack end. Connect the audio Teensy's MAX3485 to A/B/GND.
+9. **Power the audio Teensy** — it starts listening as soon as it boots (no host OS). Use USB Serial for bench verification.
 
 ## Sub-READMEs
 
 - [Firmware/README.md](Firmware/README.md) - Teensyduino setup, library install, pin map, idle/play state machine, animation paste workflow, tuning constants, troubleshooting.
-- [Audio/README.md](Audio/README.md) - Pi setup, USB-RS485 adapter, Python venv, `config.yaml` schema, running manually vs systemd, troubleshooting.
+- [Audio/README.md](Audio/README.md) - Teensy 3.2 + Audio Shield setup, SD card naming, Teensyduino flash, troubleshooting.
 
 ## Defaults
 
@@ -349,6 +349,6 @@ Run a 3-conductor cable between all nodes: A, B, and a GND reference wire. CAT5 
 | Min motion velocity | 15 deg/s | `TILT_MIN_VELOCITY_DPS` in `Firmware/Seesaw/config.h` |
 | Event cooldown | 150 ms | `TILT_EVENT_COOLDOWN_MS` in `Firmware/Seesaw/config.h` |
 | Tilt sample rate | 100 Hz | `TILT_SAMPLE_INTERVAL_MS` in `Firmware/Seesaw/config.h` |
-| RS485 baud | 115200 | `RS485_BAUD` in firmware AND `serial.baud` in `Audio/config.yaml` |
+| RS485 baud | 115200 | `RS485_BAUD` in seesaw firmware AND `Audio/SeesawAudio/config.h` |
 | Resend count | 2 | `RS485_RESEND_COUNT` in `Firmware/Seesaw/config.h` |
-| Polyphony | 32 voices | `audio.channels` in `Audio/config.yaml` |
+| Polyphony | 8 voices (default) | `MAX_VOICES` in `Audio/SeesawAudio/config.h` |

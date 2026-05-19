@@ -18,7 +18,7 @@
 //
 //   PLAY: triggered by a tilt event. On every event the firmware:
 //         1. Sends a 6-byte event frame over RS485 (announcing this
-//            seesaw's ID and the new direction) to the Pi audio player.
+//            seesaw's ID and the new direction) to the central audio Teensy.
 //         2. Plays the chase animation on the pair of LED strips that
 //            lives on whichever side just bottomed out. DIR_A lights
 //            the SIDE_A pair (PIN_LED_STRIP_A1/A2) playing the chase
@@ -33,7 +33,7 @@
 //
 // In addition to tilt events, the firmware sends a state-change event
 // (EVT_STATE_IDLE / EVT_STATE_PLAY) on every IDLE<->PLAY transition,
-// including the boot-into-IDLE transition. The Pi audio player has a
+// including the boot-into-IDLE transition. The central audio Teensy has a
 // listener stub for these but does nothing with them today; the wire
 // path is in place so idle-aware audio behavior (attract music,
 // prompts, etc.) can be added later without changing this firmware.
@@ -41,10 +41,9 @@
 // Hardware:
 //   - Teensy 4.0 powered from per-seesaw 24V to 5V buck on VIN.
 //   - MPU6050 breakout on the default Wire bus (pins 18 SDA / 19 SCL).
-//   - Four WS2813 strips (45 LEDs each) driven via a 74AHCT125 (5V)
-//     buffer, two per side of the seesaw.
-//   - MAX3485 (3.3V) RS485 transceiver on Serial1 with DE/RE on
-//     PIN_RS485_DE; bus carries A, B and a GND reference wire.
+//   - Four WS2813 strips (45 LEDs each) on GPIO 6/7/8/9 via a 74AHCT125
+//     (5V) buffer, two per side of the seesaw (Adafruit_NeoPixel driver).
+//   - MAX3485 (3.3V) on Serial1: RX pin 0, TX pin 1, DE+RE pin 2.
 //
 // Per-board configuration: edit SEESAW_ID in config.h before flashing.
 // Gyro axis, sampling rate, velocity threshold, and event cooldown also
@@ -55,7 +54,7 @@
 #include <Wire.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
-#include <WS2812Serial.h>
+#include <Adafruit_NeoPixel.h>
 
 #include "config.h"
 #include "protocol.h"
@@ -67,40 +66,38 @@ static_assert(CHASE_NUM_LEDS <= STRIP_NUM_LEDS,
 static_assert(IDLE_NUM_LEDS <= STRIP_NUM_LEDS,
               "IDLE_NUM_LEDS must not exceed STRIP_NUM_LEDS");
 
-// ---- LED strips -----------------------------------------------------
+// ---- LED strips (Adafruit_NeoPixel on fixed GPIO 6/7/8/9) ------------
 //
-// Four physical strips, paired by which side of the seesaw they live on.
-// Pair A = ledsA1 + ledsA2 on SIDE_A; pair B = ledsB1 + ledsB2 on SIDE_B.
-// Only one pair lights at a time during a chase (the one matching the
-// triggered side); both strips in that pair receive identical pixel
-// data so they stay perfectly in sync. Buffers are sized to
-// STRIP_NUM_LEDS (the physical strip length); drawFrame only writes the
-// first CHASE_NUM_LEDS pixels, so a chase narrower than the strip
-// leaves the trailing pixels dark (cleared on stop).
+// Thin wrapper keeps the rest of the sketch unchanged. NeoPixel can use
+// any GPIO (unlike WS2812Serial, which requires UART TX pins).
 
-byte           ledA1Drawing[STRIP_NUM_LEDS * 3];
-DMAMEM byte    ledA1Display[STRIP_NUM_LEDS * 12];
-WS2812Serial   ledsA1(STRIP_NUM_LEDS, ledA1Display, ledA1Drawing,
-                      PIN_LED_STRIP_A1, WS2811_GRB);
+class LedStrip {
+public:
+  Adafruit_NeoPixel pixels;
 
-byte           ledA2Drawing[STRIP_NUM_LEDS * 3];
-DMAMEM byte    ledA2Display[STRIP_NUM_LEDS * 12];
-WS2812Serial   ledsA2(STRIP_NUM_LEDS, ledA2Display, ledA2Drawing,
-                      PIN_LED_STRIP_A2, WS2811_GRB);
+  LedStrip(uint16_t count, uint8_t pin)
+      : pixels(count, pin, NEO_GRB + NEO_KHZ800) {}
 
-byte           ledB1Drawing[STRIP_NUM_LEDS * 3];
-DMAMEM byte    ledB1Display[STRIP_NUM_LEDS * 12];
-WS2812Serial   ledsB1(STRIP_NUM_LEDS, ledB1Display, ledB1Drawing,
-                      PIN_LED_STRIP_B1, WS2811_GRB);
+  void begin() {
+    pixels.begin();
+    pixels.show();
+  }
 
-byte           ledB2Drawing[STRIP_NUM_LEDS * 3];
-DMAMEM byte    ledB2Display[STRIP_NUM_LEDS * 12];
-WS2812Serial   ledsB2(STRIP_NUM_LEDS, ledB2Display, ledB2Drawing,
-                      PIN_LED_STRIP_B2, WS2811_GRB);
+  void setPixel(int i, uint8_t r, uint8_t g, uint8_t b) {
+    pixels.setPixelColor(i, pixels.Color(r, g, b));
+  }
 
-WS2812Serial* const stripsA[]   = { &ledsA1, &ledsA2 };  // SIDE_A pair
-WS2812Serial* const stripsB[]   = { &ledsB1, &ledsB2 };  // SIDE_B pair
-WS2812Serial* const allStrips[] = { &ledsA1, &ledsA2, &ledsB1, &ledsB2 };
+  void show() { pixels.show(); }
+};
+
+LedStrip ledsA1(STRIP_NUM_LEDS, PIN_LED_STRIP_A1);
+LedStrip ledsA2(STRIP_NUM_LEDS, PIN_LED_STRIP_A2);
+LedStrip ledsB1(STRIP_NUM_LEDS, PIN_LED_STRIP_B1);
+LedStrip ledsB2(STRIP_NUM_LEDS, PIN_LED_STRIP_B2);
+
+LedStrip* const stripsA[]   = { &ledsA1, &ledsA2 };
+LedStrip* const stripsB[]   = { &ledsB1, &ledsB2 };
+LedStrip* const allStrips[] = { &ledsA1, &ledsA2, &ledsB1, &ledsB2 };
 const size_t   STRIPS_PER_SIDE = sizeof(stripsA)   / sizeof(stripsA[0]);
 const size_t   NUM_STRIPS      = sizeof(allStrips) / sizeof(allStrips[0]);
 
@@ -157,6 +154,164 @@ static_assert(sizeof(IDLE_FRAME_OFFSETS) / sizeof(IDLE_FRAME_OFFSETS[0])
 
 uint8_t        txSeq = 0;
 
+// ---- Diagnostics (USB Serial) ----------------------------------------
+
+#if SERIAL_DIAG_ENABLE
+static elapsedMillis diagTimer;
+static uint32_t      diagIdleDraws   = 0;
+static uint32_t      diagChaseDraws    = 0;
+static uint32_t      diagShowCalls     = 0;
+static uint32_t      diagTiltEvents    = 0;
+static uint32_t      diagRs485Events   = 0;
+static float         diagLastGyroDps   = 0.0f;
+
+static const char* motionDirName(MotionDir d) {
+  switch (d) {
+    case MOTION_TOWARD_A: return "TOWARD_A";
+    case MOTION_TOWARD_B: return "TOWARD_B";
+    default:              return "NONE";
+  }
+}
+
+static const char* systemStateName(SystemState s) {
+  return (s == STATE_IDLE) ? "IDLE" : "PLAY";
+}
+
+static uint8_t idleFramePeakRgb(int frameIndex) {
+  uint8_t peak = 0;
+  for (int i = 0; i < (int)IDLE_NUM_LEDS; i++) {
+    peak = max(peak, pgm_read_byte(&idle[frameIndex][i * 3 + 0]));
+    peak = max(peak, pgm_read_byte(&idle[frameIndex][i * 3 + 1]));
+    peak = max(peak, pgm_read_byte(&idle[frameIndex][i * 3 + 2]));
+  }
+  return peak;
+}
+
+static uint8_t idleAnimPeakRgb() {
+  uint8_t peak = 0;
+  for (int f = 0; f < (int)IDLE_NUM_FRAMES; f++) {
+    peak = max(peak, idleFramePeakRgb(f));
+  }
+  return peak;
+}
+
+static void diagPrintPinWarnings() {
+  if (PIN_RS485_DE == 1) {
+    Serial.println("  WARN: PIN_RS485_DE=1 conflicts with Serial1 TX");
+  }
+  const uint8_t ledPins[] = {
+    PIN_LED_STRIP_A1, PIN_LED_STRIP_A2,
+    PIN_LED_STRIP_B1, PIN_LED_STRIP_B2,
+  };
+  if (PIN_RS485_DE == ledPins[0] || PIN_RS485_DE == ledPins[1]
+      || PIN_RS485_DE == ledPins[2] || PIN_RS485_DE == ledPins[3]) {
+    Serial.println("  WARN: PIN_RS485_DE overlaps an LED data pin");
+  }
+}
+
+static void diagPrintBootBanner() {
+  Serial.println();
+  Serial.println("=== Seesaw diag ===");
+  Serial.print("SEESAW_ID=");
+  Serial.println(SEESAW_ID);
+  Serial.print("state=");
+  Serial.println(systemStateName(systemState));
+  Serial.print("LED pins A1/A2/B1/B2 = ");
+  Serial.print(PIN_LED_STRIP_A1); Serial.print('/');
+  Serial.print(PIN_LED_STRIP_A2); Serial.print('/');
+  Serial.print(PIN_LED_STRIP_B1); Serial.print('/');
+  Serial.println(PIN_LED_STRIP_B2);
+  Serial.print("STRIP_NUM_LEDS=");
+  Serial.print(STRIP_NUM_LEDS);
+  Serial.print(" CHASE=");
+  Serial.print(CHASE_NUM_LEDS);
+  Serial.print('x');
+  Serial.print(CHASE_NUM_FRAMES);
+  Serial.print(" IDLE=");
+  Serial.print(IDLE_NUM_LEDS);
+  Serial.print('x');
+  Serial.print(IDLE_NUM_FRAMES);
+  Serial.print(" LED_BRIGHTNESS=");
+  Serial.println(LED_BRIGHTNESS);
+  if (CHASE_NUM_LEDS < STRIP_NUM_LEDS || IDLE_NUM_LEDS < STRIP_NUM_LEDS) {
+    Serial.print("  NOTE: anim ");
+    Serial.print(IDLE_NUM_LEDS);
+    Serial.print("/");
+    Serial.print(CHASE_NUM_LEDS);
+    Serial.print(" LEDs tiled across ");
+    Serial.print(STRIP_NUM_LEDS);
+    Serial.println("-pixel strips");
+  }
+  Serial.print("MPU6050 @ 0x");
+  Serial.print(MPU_I2C_ADDR, HEX);
+  Serial.print(": ");
+  Serial.println(mpuOk ? "OK" : "FAILED (tilt events disabled)");
+  if (!mpuOk) {
+    Serial.println("  Check I2C wiring (SDA=18, SCL=19), 3V3 power, ADDR pin.");
+  }
+  diagPrintPinWarnings();
+  Serial.print("idle peak RGB byte (brightest frame)=");
+  Serial.println(idleAnimPeakRgb());
+  Serial.println("After tilt: PLAY until 60s quiet, then IDLE animation resumes.");
+  Serial.println("===================");
+}
+
+static void diagPrintPeriodic() {
+  Serial.println();
+  Serial.println("--- status ---");
+  Serial.print("state=");
+  Serial.print(systemStateName(systemState));
+  Serial.print(" chaseActive=");
+  Serial.print(chaseActive ? 1 : 0);
+  Serial.print(" chaseFrame=");
+  Serial.print(chaseFrame);
+  Serial.print(" idleFrame=");
+  Serial.println(idleFrame);
+
+  Serial.print("draws: idle=");
+  Serial.print(diagIdleDraws);
+  Serial.print(" chase=");
+  Serial.print(diagChaseDraws);
+  Serial.print(" show=");
+  Serial.println(diagShowCalls);
+  if (diagIdleDraws == 0 && systemState == STATE_IDLE) {
+    Serial.println("  WARN: no idle draws yet - tickIdle/drawIdleFrame not running?");
+  }
+  if (diagShowCalls == 0) {
+    Serial.println("  WARN: showStrips() never called - LEDs cannot update");
+  }
+
+  Serial.print("tiltEvents=");
+  Serial.print(diagTiltEvents);
+  Serial.print(" rs485Events=");
+  Serial.println(diagRs485Events);
+
+  if (mpuOk) {
+    Serial.print("gyro=");
+    Serial.print(diagLastGyroDps, 1);
+    Serial.print(" dps motion=");
+    Serial.print(motionDirName(motionDir));
+    Serial.print(" cooldownMs=");
+    Serial.println((unsigned)cooldownTimer);
+  } else {
+    Serial.println("gyro=N/A (MPU not initialized)");
+  }
+
+  Serial.print("idleTimer=");
+  Serial.print((unsigned long)idleTimer);
+  Serial.print(" ms (timeout ");
+  Serial.print(IDLE_TIMEOUT_MS);
+  Serial.println(")");
+  Serial.println("--------------");
+}
+
+static void diagTick() {
+  if (diagTimer < SERIAL_DIAG_INTERVAL_MS) return;
+  diagTimer = 0;
+  diagPrintPeriodic();
+}
+#endif  // SERIAL_DIAG_ENABLE
+
 // ---- Forward decls --------------------------------------------------
 
 static float   readGyroAxis();
@@ -172,17 +327,67 @@ static void    drawFrame(int frameIndex);
 static void    drawIdleFrame();
 static void    clearStrips();
 static void    showStrips();
+#if BENCH_LED_SELFTEST
+static void    benchLedSelfTest();
+#endif
 
 // ---- Setup / loop ---------------------------------------------------
 
+#if SERIAL_DIAG_ENABLE
+static void diagCheckpoint(const char *label) {
+  Serial.println(label);
+  Serial.flush();
+}
+#else
+static void diagCheckpoint(const char *) {}
+#endif
+
 void setup() {
+#if SERIAL_DIAG_ENABLE
+  Serial.begin(SERIAL_BAUD);
+  while (!Serial && millis() < 3000) { /* USB console */ }
+  static uint32_t bootCount = 0;
+  bootCount++;
+  Serial.println();
+  Serial.print("=== Seesaw setup #");
+  Serial.print(bootCount);
+  Serial.println(bootCount > 1 ? " (reboot loop?)" : "");
+  Serial.flush();
+#endif
+
+  diagCheckpoint("Serial1 + RS485 DE...");
   Serial1.begin(RS485_BAUD);
   Serial1.transmitterEnable(PIN_RS485_DE);
 
-  for (size_t s = 0; s < NUM_STRIPS; s++) allStrips[s]->begin();
-  clearStrips();
-  showStrips();
+  diagCheckpoint("LED begin...");
+  for (size_t s = 0; s < NUM_STRIPS; s++) {
+    allStrips[s]->begin();
+#if SERIAL_DIAG_ENABLE
+    Serial.print("  strip ");
+    Serial.println(s);
+    Serial.flush();
+#endif
+  }
 
+  diagCheckpoint("clearStrips...");
+  clearStrips();
+
+  diagCheckpoint("showStrips (per strip)...");
+  for (size_t s = 0; s < NUM_STRIPS; s++) {
+#if SERIAL_DIAG_ENABLE
+    Serial.print("  show strip ");
+    Serial.println(s);
+    Serial.flush();
+#endif
+    allStrips[s]->show();
+  }
+  diagCheckpoint("showStrips done");
+
+#if BENCH_LED_SELFTEST
+  benchLedSelfTest();
+#endif
+
+  diagCheckpoint("MPU6050 I2C...");
   Wire.begin();
   Wire.setClock(400000);
   mpuOk = mpu.begin(MPU_I2C_ADDR, &Wire);
@@ -190,6 +395,11 @@ void setup() {
     mpu.setGyroRange(MPU6050_RANGE_500_DEG);
     mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
   }
+#if SERIAL_DIAG_ENABLE
+  Serial.print("  MPU: ");
+  Serial.println(mpuOk ? "OK" : "FAILED");
+  Serial.flush();
+#endif
 
   // Reversal-based detection only fires on a true direction change, so
   // a tilted-at-power-up seesaw never produces a spurious chase. The
@@ -204,13 +414,24 @@ void setup() {
 
   // Boot directly into IDLE so the seesaw shows the idle animation
   // immediately on power-up. enterIdleState() also emits the initial
-  // EVT_STATE_IDLE frame so the Pi (if listening) sees the seesaw
+  // EVT_STATE_IDLE frame so the audio node (if listening) sees the seesaw
   // come up. The first tilt event flips this to PLAY.
+  diagCheckpoint("enterIdleState...");
   enterIdleState();
+  diagCheckpoint("setup complete");
+
+#if SERIAL_DIAG_ENABLE
+  diagPrintBootBanner();
+  diagTimer = 0;
+#endif
 }
 
 void loop() {
   pollTilt();
+
+#if SERIAL_DIAG_ENABLE
+  diagTick();
+#endif
 
   if (systemState == STATE_PLAY) {
     tickChase();
@@ -248,6 +469,9 @@ static void pollTilt() {
   sampleTimer = 0;
 
   float vel = readGyroAxis();
+#if SERIAL_DIAG_ENABLE
+  diagLastGyroDps = vel;
+#endif
 
   // Negative velocity = moving toward SIDE_A, positive = toward SIDE_B.
   // Inside the +/- TILT_MIN_VELOCITY_DPS dead zone we hold the previous
@@ -273,11 +497,18 @@ static void pollTilt() {
 }
 
 static void onTiltChange(uint8_t direction) {
+#if SERIAL_DIAG_ENABLE
+  diagTiltEvents++;
+  Serial.print("TILT dir=");
+  Serial.print(direction == DIR_A ? 'A' : 'B');
+  Serial.print(" state was ");
+  Serial.println(systemStateName(systemState));
+#endif
   // Any tilt event resets the idle countdown, regardless of state.
   idleTimer = 0;
   // Order matters on the wire: if this tilt is what lifts us out of
   // IDLE, the EVT_STATE_PLAY frame goes out first (from enterPlayState),
-  // so the Pi sees the state transition before the tilt that caused it.
+  // so the audio node sees the state transition before the tilt that caused it.
   if (systemState == STATE_IDLE) {
     enterPlayState();
   }
@@ -288,12 +519,15 @@ static void onTiltChange(uint8_t direction) {
 // ---- State transitions ---------------------------------------------
 //
 // Both transition functions emit a state-change event on RS485 after
-// updating local state. The Pi has a listener stub for these (see
-// Audio/seesaw_audio.py on_state_change); today it just logs and does
+// updating local state. The audio Teensy has a listener stub for these (see
+// Audio/SeesawAudio onStateChange); today it just logs and does
 // nothing else, but the firmware always sends them so the wire path
 // is in place.
 
 static void enterIdleState() {
+#if SERIAL_DIAG_ENABLE
+  Serial.println("-> enterIdleState");
+#endif
   systemState = STATE_IDLE;
   idleFrame = 0;
   idleFrameTimer = 0;
@@ -305,6 +539,9 @@ static void enterIdleState() {
 }
 
 static void enterPlayState() {
+#if SERIAL_DIAG_ENABLE
+  Serial.println("-> enterPlayState");
+#endif
   systemState = STATE_PLAY;
   // Wipe any in-progress idle animation so the new chase starts from
   // a clean slate. The chase's drawFrame() handles black-fill of the
@@ -326,6 +563,13 @@ static void enterPlayState() {
 // loop iteration.
 
 static void sendEvent(uint8_t event) {
+#if SERIAL_DIAG_ENABLE
+  diagRs485Events++;
+  Serial.print("RS485 event=");
+  Serial.print(event);
+  Serial.print(" seq=");
+  Serial.println(txSeq);
+#endif
   uint8_t seq = txSeq++;
   uint8_t buf[FRAME_SIZE];
   buildFrame(buf, SEESAW_ID, event, seq);
@@ -378,18 +622,22 @@ static inline uint8_t scaleBrightness(uint8_t v) {
 }
 
 static void drawFrame(int frameIndex) {
+#if SERIAL_DIAG_ENABLE
+  diagChaseDraws++;
+#endif
   // Active pair gets the chase frame; the other pair is held dark for
   // the duration of the chase so feedback localizes to the triggered
   // side. The inactive pair is blanked here on every frame so a fresh
   // chase that fires on the opposite side immediately darkens the
   // previously-lit pair without needing a separate clear step.
-  WS2812Serial* const* active   = (chaseSide == CHASE_ON_SIDE_A) ? stripsA : stripsB;
-  WS2812Serial* const* inactive = (chaseSide == CHASE_ON_SIDE_A) ? stripsB : stripsA;
+  LedStrip* const* active   = (chaseSide == CHASE_ON_SIDE_A) ? stripsA : stripsB;
+  LedStrip* const* inactive = (chaseSide == CHASE_ON_SIDE_A) ? stripsB : stripsA;
 
-  for (int i = 0; i < (int)CHASE_NUM_LEDS; i++) {
-    uint8_t r = scaleBrightness(pgm_read_byte(&chase[frameIndex][i * 3 + 0]));
-    uint8_t g = scaleBrightness(pgm_read_byte(&chase[frameIndex][i * 3 + 1]));
-    uint8_t b = scaleBrightness(pgm_read_byte(&chase[frameIndex][i * 3 + 2]));
+  for (int i = 0; i < (int)STRIP_NUM_LEDS; i++) {
+    const int src = i % (int)CHASE_NUM_LEDS;
+    uint8_t r = scaleBrightness(pgm_read_byte(&chase[frameIndex][src * 3 + 0]));
+    uint8_t g = scaleBrightness(pgm_read_byte(&chase[frameIndex][src * 3 + 1]));
+    uint8_t b = scaleBrightness(pgm_read_byte(&chase[frameIndex][src * 3 + 2]));
     for (size_t s = 0; s < STRIPS_PER_SIDE; s++) {
       active[s]->setPixel(i, r, g, b);
       inactive[s]->setPixel(i, 0, 0, 0);
@@ -409,16 +657,20 @@ static void tickIdle() {
 }
 
 static void drawIdleFrame() {
+#if SERIAL_DIAG_ENABLE
+  diagIdleDraws++;
+#endif
   // Each strip plays the same idle animation but offset by its own
   // IDLE_FRAME_OFFSETS[s] frames, so the four strips are phase-shifted.
   // The animation loops indefinitely while the system is in IDLE.
   for (size_t s = 0; s < NUM_STRIPS; s++) {
     int frame = (idleFrame + IDLE_FRAME_OFFSETS[s]) % (int)IDLE_NUM_FRAMES;
     if (frame < 0) frame += (int)IDLE_NUM_FRAMES;   // safety if offset is negative
-    for (int i = 0; i < (int)IDLE_NUM_LEDS; i++) {
-      uint8_t r = scaleBrightness(pgm_read_byte(&idle[frame][i * 3 + 0]));
-      uint8_t g = scaleBrightness(pgm_read_byte(&idle[frame][i * 3 + 1]));
-      uint8_t b = scaleBrightness(pgm_read_byte(&idle[frame][i * 3 + 2]));
+    for (int i = 0; i < (int)STRIP_NUM_LEDS; i++) {
+      const int src = i % (int)IDLE_NUM_LEDS;
+      uint8_t r = scaleBrightness(pgm_read_byte(&idle[frame][src * 3 + 0]));
+      uint8_t g = scaleBrightness(pgm_read_byte(&idle[frame][src * 3 + 1]));
+      uint8_t b = scaleBrightness(pgm_read_byte(&idle[frame][src * 3 + 2]));
       allStrips[s]->setPixel(i, r, g, b);
     }
   }
@@ -433,7 +685,27 @@ static void clearStrips() {
   }
 }
 
+#if BENCH_LED_SELFTEST
+static void benchLedSelfTest() {
+  Serial.println("Bench LED self-test: all strips full white 0.5s");
+  Serial.flush();
+  const uint8_t v = scaleBrightness(80);
+  for (int i = 0; i < (int)STRIP_NUM_LEDS; i++) {
+    for (size_t s = 0; s < NUM_STRIPS; s++) {
+      allStrips[s]->setPixel(i, v, v, v);
+    }
+  }
+  showStrips();
+  delay(500);
+  clearStrips();
+  showStrips();
+}
+#endif
+
 static void showStrips() {
+#if SERIAL_DIAG_ENABLE
+  diagShowCalls++;
+#endif
   for (size_t s = 0; s < NUM_STRIPS; s++) {
     allStrips[s]->show();
   }

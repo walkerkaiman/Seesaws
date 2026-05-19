@@ -2,7 +2,7 @@
 #include <Arduino.h>
 
 // =====================================================================
-// RS485 wire protocol (shared with Audio/SeesawAudio on the central Teensy)
+// RS485 wire protocol (shared with Firmware/Seesaw/protocol.h)
 // =====================================================================
 //
 // Fixed 6-byte little-endian frame, 8N1 at RS485_BAUD:
@@ -11,41 +11,34 @@
 //   byte 1 : 0x55          start-of-frame 2
 //   byte 2 : id            seesaw id (1..255)
 //   byte 3 : event         event code, see EVENT CODES below
-//   byte 4 : seq           rolling counter, used by the audio node for dedupe
+//   byte 4 : seq           rolling counter, used for dedupe
 //   byte 5 : crc8          CRC-8 (poly 0x07) over bytes 2..4
 //
 // EVENT CODES (byte 3):
 //
-//   Tilt events - one side bottomed out (drives SD WAV playback on central Teensy):
-//     DIR_A           0    SIDE_A bottomed out (also EVT_TILT_A)
-//     DIR_B           1    SIDE_B bottomed out (also EVT_TILT_B)
+//   Tilt events - one side bottomed out (drive SD WAV playback):
+//     DIR_A / EVT_TILT_A   0    SIDE_A bottomed out
+//     DIR_B / EVT_TILT_B   1    SIDE_B bottomed out
 //
 //   State-change events - the seesaw's mode just changed:
-//     EVT_STATE_IDLE  2    just entered IDLE (boot, or PLAY -> IDLE timeout)
-//     EVT_STATE_PLAY  3    just entered PLAY (first tilt out of IDLE)
+//     EVT_STATE_IDLE       2    entered IDLE
+//     EVT_STATE_PLAY       3    entered PLAY
 //
-//   Tilt events play sounds/{id}_A.wav or sounds/{id}_B.wav on the Audio
-//   Shield SD card (id = byte 2). State-change events are logged by the
-//   central Teensy listener stub (onStateChange in SeesawAudio.ino) for
-//   future idle-aware behavior without another seesaw firmware change.
+// Tilt events play Audio/sounds/{id}_A.wav or {id}_B.wav on the SD card.
+// State-change events are logged only (hook for future idle-aware audio).
 //
 // Each event is transmitted RS485_RESEND_COUNT times with random jitter.
-// The audio node accepts the first valid (id, seq) pair and ignores duplicates.
+// This node accepts the first valid (id, seq) pair and ignores duplicates.
 // =====================================================================
 
 #define FRAME_SOF1  0xAA
 #define FRAME_SOF2  0x55
 #define FRAME_SIZE  6
 
-// Tilt events (byte 3 = 0..1). DIR_A/DIR_B are the historical names; the
-// EVT_TILT_* aliases match the broader "event code" framing.
 #define DIR_A           0
 #define DIR_B           1
 #define EVT_TILT_A      DIR_A
 #define EVT_TILT_B      DIR_B
-
-// State-change events (byte 3 = 2..3). Sent on every IDLE<->PLAY
-// transition. The central audio Teensy logs these; no playback today.
 #define EVT_STATE_IDLE  2
 #define EVT_STATE_PLAY  3
 

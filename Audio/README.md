@@ -1,220 +1,112 @@
-# Audio player (Raspberry Pi)
+# Audio node (Teensy 3.2 + Audio Shield)
 
-Polyphonic audio player that listens on RS485 for events from the seesaws and plays the sound mapped to each `(seesaw_id, direction)`. New events never cut off in-flight sounds. Adding a seesaw is one entry in `config.yaml` - no code changes.
+Polyphonic audio player that listens on RS485 for tilt events from the seesaws and plays WAV files from the Audio Shield SD card. Multiple sounds overlap freely — new tilts never cut off sounds already playing.
 
-The seesaws also emit IDLE/PLAY state-change events on every transition. The player has a [listener stub](#state-change-events-idleplay) for them today (they're logged but not acted on); idle-aware audio behavior can be hooked in there later without any firmware change.
+Sound files are named by **seesaw ID** and **direction**. When seesaw `N` triggers side A, the player looks for `sounds/N_A.wav` on the SD card; side B plays `sounds/N_B.wav`. The number in the filename must match the `SEESAW_ID` flashed into that seesaw's firmware. Adding a seesaw is just copying two WAV files onto the card — no config file and no code change.
+
+The seesaws also emit IDLE/PLAY state-change events. The audio sketch logs them on USB Serial today ([listener stub](#state-change-events-idleplay)); idle-aware behavior can be hooked in later without firmware changes on the seesaws.
 
 See the [root README](../README.md) for system architecture and wiring.
 
 ## Layout
 
-- [seesaw_audio.py](seesaw_audio.py) - main script
-- [config.yaml](config.yaml) - serial port, audio settings, per-seesaw sound map
-- [requirements.txt](requirements.txt) - Python deps
-- [seesaw-audio.service](seesaw-audio.service) - optional systemd unit
-- [sounds/](sounds/) - drop your WAV files here
+- [SeesawAudio/](SeesawAudio/) — Arduino sketch (`SeesawAudio.ino`, `config.h`, `protocol.h`)
+- [sounds/](sounds/) — source WAVs to copy onto the SD card (not read from the repo at runtime)
 
 ## Hardware
 
-A USB-to-RS485 adapter plugged into any of the Pi's USB ports. Avoid the Pi's GPIO UART for this - level mismatch (Pi GPIO is 3.3 V, classic MAX485 boards are 5 V) and Bluetooth UART contention make it more trouble than it's worth.
+- **Teensy 3.2** + **PJRC Audio Shield** (Rev B or later)
+- **MAX3485** or **SN65HVD3082** on **Serial1** (RX pin 0, TX pin 1, DE+RE on pin 2 — same pinout as the seesaw firmware)
+- **microSD card** in the Audio Shield (FAT32, copy the `sounds/` folder to the card root)
+- Line-out or headphone jack on the shield → your rack amplifier or powered speakers
+
+Do **not** wire RS485 to Serial2 (pins 7/8) — those pins are used by the Audio Shield.
 
 ### What lives at the central rack
 
 ```mermaid
 flowchart LR
     subgraph rack [Central weatherproof rack box - mains AC inlet]
-        Mains["Mains inlet<br/>+ fused breaker"]
+        Mains["Mains inlet"]
         PSU24["24V central PSU"]
-        Pi[Raspberry Pi]
-        DAC["Audio out<br/>(USB DAC or Pi 3.5mm)"]
-        Amp["Audio amplifier<br/>(line-in to speaker-level)"]
-        Adapter[USB to RS485 adapter]
-        Bias["Bias resistors<br/>~680 ohm A to 3V3<br/>~680 ohm B to GND<br/>(this end of the bus only)"]
-        Term["120 ohm termination<br/>across A-B<br/>(this end of the bus)"]
+        TAudio["Teensy 3.2 + Audio Shield"]
+        Amp["Audio amplifier<br/>(if not using powered speakers)"]
+        XCVR["MAX3485 on Serial1"]
+        Bias["Bias resistors<br/>~680 ohm A to 3V3<br/>~680 ohm B to GND"]
+        Term["120 ohm termination<br/>across A-B"]
         Mains --> PSU24
-        Mains --> Pi
-        Mains --> Amp
-        Pi --- DAC -->|"line-level"| Amp -->|"speaker-level"| Speakers
-        Pi --- Adapter
-        Adapter --- Bias --- Term
+        Mains --> TAudio
+        TAudio -->|"line-out"| Amp
+        TAudio --- XCVR
+        XCVR --- Bias --- Term
     end
-    PSU24 -->|"+24V trunk + GND<br/>thin 16-18 AWG to each seesaw"| Field["Per-seesaw bucks + electronics"]
-    Term -->|"RS485 A + B<br/>shares GND with 24V return<br/>up to ~20 ft to farthest seesaw"| Field
+    PSU24 -->|"+24V trunk"| Field["Per-seesaw bucks + electronics"]
+    Term -->|"RS485 A + B + GND"| Field
 ```
 
-Everything mains-fed lives in this rack box: the 24 V PSU that powers the seesaws, the Raspberry Pi, and the audio amplifier. The only electronics outside this box are the seesaws themselves (Teensy, transceiver, level shifter, LED strips) and a small 24V→5V buck converter inside an IP65 junction box on each seesaw - all powered from the rack's 24 V trunk and signaled by the rack's RS485 line.
+The other end of the RS485 bus (farthest seesaw) needs its own 120 Ω termination. **Bias resistors go at this rack end only**, never at both ends.
 
-The other end of the RS485 bus (at the seesaw farthest from the rack) needs its own 120 ohm termination resistor. **Bias resistors go at the rack end only**, never at both ends.
+Power the Teensy from the rack's 5 V supply (USB VIN with `VIN`/`VUSB` cut if you also use USB for bench programming) or a dedicated 5 V buck off the 24 V trunk.
 
-### Amplifier choices
+## Sound file naming
 
-Two practical setups; pick whichever fits your venue:
+Files live in folder `sounds/` on the SD card (matches `SOUNDS_DIR` in [config.h](SeesawAudio/config.h)):
 
-- **Passive speakers + dedicated amp**: a small Class D board (TPA3116-based 50 W stereo amps are ~$15-25; Adafruit MAX9744 20 W stereo is a tidy ready-made option) driven from the Pi's 3.5 mm jack or a USB DAC. Cleanest signal path, easiest to size to the speakers.
-- **Powered speakers / PA**: skip the discrete amp and feed line-level straight into a self-powered speaker or a small PA system. One fewer box at the rack, but you're locked into whatever the speaker's amp does.
-
-The audio player itself does not care which path you choose - `pygame.mixer` outputs whatever the OS audio device produces. If you're using a USB DAC, set its name as a substring in `audio.device` in `config.yaml`.
-
-The other end of the RS485 bus (at the seesaw cluster) needs its own 120 ohm termination resistor. **Bias resistors go at this end only**, never at both.
-
-### Finding the serial device
-
-After plugging in, find the device:
-
-```bash
-dmesg | tail               # watch the kernel name your adapter
-ls -l /dev/serial/by-id/   # stable per-device path
-```
-
-You'll see something like `/dev/ttyUSB0`. Use that in `config.yaml`. For a stable name across reboots when other USB serial devices are present, add a udev rule:
-
-```bash
-# /etc/udev/rules.d/99-seesaws.rules
-SUBSYSTEM=="tty", ATTRS{idVendor}=="<vid>", ATTRS{idProduct}=="<pid>", SYMLINK+="ttyRS485"
-```
-
-Get `<vid>`/`<pid>` from `lsusb`. Then `serial.port: /dev/ttyRS485`.
-
-## Python setup
-
-The Pi must have system-level audio output already working (test with `aplay /usr/share/sounds/alsa/Front_Center.wav`). Then create a venv and install deps:
-
-```bash
-cd /home/pi/Seesaws/Audio
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-Dependencies:
-
-- `pyserial` - serial port I/O
-- `pygame` - the actual audio mixer (SDL_mixer under the hood, polyphonic)
-- `PyYAML` - config parsing
-
-Pygame on Raspberry Pi OS may need a few SDL system packages already installed by default; if `pip install pygame` complains, run `sudo apt install python3-pygame` once or `sudo apt install libsdl2-mixer-2.0-0`.
-
-## Configuration (`config.yaml`)
-
-```yaml
-serial:
-  port: /dev/ttyUSB0     # or /dev/ttyRS485 with the udev rule above
-  baud: 115200           # must match RS485_BAUD in firmware
-
-audio:
-  frequency: 44100
-  buffer: 512            # smaller = lower latency, larger = fewer underruns
-  channels: 32           # max simultaneous overlapping sounds
-  # device: "USB Audio"  # optional: substring match for a specific output
-
-sounds:
-  1:
-    A: sounds/seesaw1_A.wav
-    B: sounds/seesaw1_B.wav
-  2:
-    A: sounds/seesaw2_A.wav
-    B: sounds/seesaw2_B.wav
-```
+| Seesaw `SEESAW_ID` | Tilt event | Filename |
+|---|---|---|
+| 1 | SIDE_A (`EVT_TILT_A`, wire code 0) | `sounds/1_A.wav` |
+| 1 | SIDE_B (`EVT_TILT_B`, wire code 1) | `sounds/1_B.wav` |
+| 2 | SIDE_A | `sounds/2_A.wav` |
+| 2 | SIDE_B | `sounds/2_B.wav` |
 
 Rules:
 
-- The numeric key under `sounds:` is the firmware's `SEESAW_ID`.
-- Direction keys must be `A` or `B` and correspond to `DIR_A` / `DIR_B` in the firmware.
-- Paths are resolved relative to `config.yaml` unless absolute.
-- Adding a new seesaw means adding one new entry. The script does not need to be restarted unless you change the running configuration; restart on changes.
+- The number before `_A` / `_B` **must** equal the triggering seesaw's `SEESAW_ID` in [Firmware/Seesaw/config.h](../Firmware/Seesaw/config.h).
+- Direction letter is `A` or `B` (matches `DIR_A` / `DIR_B` on the wire).
+- **Format**: 44.1 kHz 16-bit mono or stereo WAV is recommended (what the Audio library expects).
+- **Length**: any length; voices are polyphonic.
+- **Avoid clicks**: start/end at zero crossings or add short fades in your DAW.
 
-### Sound asset guidance
+Copy the repo's [sounds/](sounds/) directory to the **root** of the microSD so the card contains `sounds/1_A.wav`, etc.
 
-- **Format**: 44.1 kHz 16-bit WAV is fastest to load and lowest latency. MP3/OGG also work.
-- **Length**: any length. The mixer is polyphonic, so a long sound and a short one will overlap correctly.
-- **Avoid clicks**: ensure the WAV starts and ends at zero crossings. Many DAWs have a "fade-in/out 5 ms" macro for this.
-- **Normalize** all sounds to roughly the same loudness to avoid surprises during installation tuning.
+## Teensyduino setup
+
+1. Install [Arduino IDE](https://www.arduino.cc/en/software) and [Teensyduino](https://www.pjrc.com/teensy/td_download.html).
+2. **Tools → Board → Teensyduino → Teensy 3.2**.
+3. Install the **Audio** library via **Sketch → Include Library → Manage Libraries** if it is not already bundled with Teensyduino.
+4. Open [SeesawAudio/SeesawAudio.ino](SeesawAudio/SeesawAudio.ino).
+5. Prepare the SD card (copy `sounds/` onto it), insert into the shield.
+6. **Upload**. Open **Tools → Audio System Design Tool** if you need to inspect the mixer graph (optional).
+
+On first boot, USB Serial (115200 baud) prints SD status and each `Playing sounds/N_X.wav` line when a seesaw tilts.
+
+### Tuning ([config.h](SeesawAudio/config.h))
+
+| Constant | Default | Purpose |
+|---|---|---|
+| `RS485_BAUD` | 115200 | Must match `RS485_BAUD` in seesaw firmware |
+| `MAX_VOICES` | 8 | Simultaneous overlapping sounds |
+| `AUDIO_MEMORY_BLOCKS` | 16 | Raise if you hear dropouts with many overlaps |
+| `SOUNDS_DIR` | `"sounds"` | Folder on the SD card |
+
+`MAX_VOICES` is wired to eight `AudioPlaySdWav` objects in the sketch; if you change it, extend the player/mixer graph in `SeesawAudio.ino` to match.
 
 ## State-change events (IDLE/PLAY)
 
-The seesaws send two kinds of frames over RS485:
+| Byte 3 | Constant | Handler |
+|---|---|---|
+| 0 | `EVT_TILT_A` | `playTilt()` → `sounds/{id}_A.wav` |
+| 1 | `EVT_TILT_B` | `playTilt()` → `sounds/{id}_B.wav` |
+| 2 | `EVT_STATE_IDLE` | `onStateChange()` (log only) |
+| 3 | `EVT_STATE_PLAY` | `onStateChange()` (log only) |
 
-| Byte 3 | Constant | Source | Handler |
-|---|---|---|---|
-| 0 | `EVT_TILT_A` (= `DIR_A`) | tilt: SIDE_A bottomed out | `play()` |
-| 1 | `EVT_TILT_B` (= `DIR_B`) | tilt: SIDE_B bottomed out | `play()` |
-| 2 | `EVT_STATE_IDLE` | seesaw entered IDLE | `on_state_change()` (stub) |
-| 3 | `EVT_STATE_PLAY` | seesaw entered PLAY | `on_state_change()` (stub) |
-
-Tilt events drive sound playback (existing behavior). State-change events are emitted by the firmware on every IDLE<->PLAY transition - boot lands in IDLE, the first tilt out of IDLE flips to PLAY, and after `IDLE_TIMEOUT_MS` (default 60 s) without activity the seesaw drops back to IDLE.
-
-The player currently has a no-op listener for state events:
-
-```python
-def on_state_change(self, sid: int, event: int, seq: int) -> None:
-    name = EVENT_NAMES.get(event, f"0x{event:02X}")
-    LOG.info("State change: seesaw %d -> %s (seq %d)", sid, name, seq)
-```
-
-It just logs at INFO level so you can see state changes scroll by while you bench-test the firmware:
-
-```
-State change: seesaw 1 -> STATE_IDLE (seq 0)
-State change: seesaw 1 -> STATE_PLAY (seq 17)
-Playing seesaw 1 A
-...
-State change: seesaw 1 -> STATE_IDLE (seq 42)
-```
-
-When you want the audio side to actually react to idle/play (attract music between sessions, ducking, etc.), edit `on_state_change` in `seesaw_audio.py`. The dispatcher in `run()` already routes `EVT_STATE_*` to it; the firmware already emits the events. No firmware change needed.
-
-There is no per-seesaw config for state events - the listener is global. If you later want different idle behavior per seesaw, key on `sid` inside `on_state_change`.
-
-## Running manually (recommended for first start)
-
-```bash
-cd /home/pi/Seesaws/Audio
-source .venv/bin/activate
-python seesaw_audio.py
-```
-
-You should see:
-
-```
-Audio ready: 44100 Hz, buffer=512, 32 voices
-Loaded seesaw 1 A -> seesaw1_A.wav
-Loaded seesaw 1 B -> seesaw1_B.wav
-...
-Serial open: /dev/ttyUSB0 @ 115200 baud
-Listening for events. Press Ctrl-C to stop.
-```
-
-Then tilt a seesaw - you should see `Playing seesaw 1 A` (or whichever direction) and hear the sound. `Ctrl-C` shuts down cleanly.
-
-Add `-v` for debug logging including dedup events and per-frame parsing detail:
-
-```bash
-python seesaw_audio.py -v
-```
-
-## Running as a systemd service (autostart on boot)
-
-The shipped unit assumes the repo lives at `/home/pi/Seesaws/` with the venv at `Audio/.venv/`. Adjust paths if yours differ.
-
-```bash
-sudo cp /home/pi/Seesaws/Audio/seesaw-audio.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable seesaw-audio.service
-sudo systemctl start seesaw-audio.service
-
-# verify
-systemctl status seesaw-audio.service
-journalctl -u seesaw-audio.service -f
-```
-
-`Restart=on-failure` brings it back if it crashes; `RestartSec=5` gives the system five seconds between attempts.
+To add idle-aware audio later, edit `onStateChange()` in `SeesawAudio.ino`. Tilt dispatch already calls `handleEvent()` for every valid frame.
 
 ## Troubleshooting
 
-- **No sound at all** -> confirm `aplay` works first, then check `audio.device` in config. Without it, pygame uses the default ALSA device. To force a specific output device, find its name with `aplay -L` and put a substring in `audio.device`.
-- **`Sound file missing`** -> path in `config.yaml` is relative to the YAML file itself, not your shell's CWD. Either keep WAVs in `sounds/` or use absolute paths.
-- **`No free channel`** -> raise `audio.channels` (try 64). Means more sounds were overlapping than the mixer was configured for.
-- **`CRC mismatch` warnings** -> bus integrity issue. Usual suspects: missing termination at one end, missing bias resistors, swapped A/B somewhere, or `serial.baud` not matching the firmware's `RS485_BAUD`.
-- **Garbled output / `No sound mapped for seesaw N direction X` for an N you didn't plan for** -> typically random noise on a poorly-terminated bus passing CRC by chance. Fix bus wiring and the spurious events stop.
-- **`Unknown event code 0x..` warnings** -> same root cause as garbled CRC-passing noise above. The firmware only ever sends event codes 0..3; anything else on a bench setup means bus integrity is the problem, not the firmware.
-- **Latency feels high** -> reduce `audio.buffer` (256 or 128). Trade-off: smaller buffers underrun more easily on a busy Pi.
+- **SD card init failed** — reseat the shield, format the card FAT32, confirm files are at `sounds/N_A.wav` not nested wrong.
+- **Missing sound: sounds/N_X.wav** — filename ID does not match the seesaw's `SEESAW_ID`, or the file was not copied to the card.
+- **No free voice** — more overlaps than `MAX_VOICES`; increase voices (and mixer wiring) or shorten WAVs.
+- **CRC mismatch on Serial** — bus wiring: termination at both ends, bias at rack end only, `RS485_BAUD` matches firmware.
+- **Dedup seesaw … seq …** — normal; firmware resends each event twice.
+- **Distortion / dropouts** — raise `AUDIO_MEMORY_BLOCKS` or reduce `MAX_VOICES`.

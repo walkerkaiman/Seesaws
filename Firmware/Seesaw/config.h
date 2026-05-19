@@ -5,7 +5,8 @@
 // =====================================================================
 //
 // Edit these values per seesaw before flashing. SEESAW_ID must be unique
-// across the bus and must match an entry in the Pi's config.yaml.
+// across the bus. The central audio Teensy plays sounds/{SEESAW_ID}_A.wav
+// and sounds/{SEESAW_ID}_B.wav from its SD card when that id tilts.
 //
 // =====================================================================
 
@@ -67,37 +68,42 @@
 //   255 -> ~60 mA    192 -> ~45 mA    128 -> ~30 mA    64 -> ~15 mA
 #define LED_BRIGHTNESS 255
 
+// ---- USB Serial diagnostics -----------------------------------------
+//
+// Open the Teensy USB Serial Monitor at SERIAL_BAUD while bench-testing.
+// Periodic status lines print every SERIAL_DIAG_INTERVAL_MS; tilt/state
+// transitions and LED draws are logged immediately when enabled.
+#define SERIAL_DIAG_ENABLE          1
+#define SERIAL_BAUD                 115200
+#define SERIAL_DIAG_INTERVAL_MS     2000
+
+// At boot, flash every LED on all four strips (verifies wiring/power).
+// Set 0 once strips are confirmed working.
+#define BENCH_LED_SELFTEST          1
+
 // ---- Pin assignments (Teensy 4.0) -----------------------------------
 //
 //   I2C_SDA / I2C_SCL    - MPU6050 accelerometer over the default Wire bus.
 //                          Teensy 4.0 Wire = pin 18 (SDA) / pin 19 (SCL).
 //                          Module already has built-in 4.7k pull-ups, so no
 //                          external resistors needed.
-//   PIN_LED_STRIP_A1/A2  - SIDE_A LED strip pair. Both pins receive the
-//   PIN_LED_STRIP_B1/B2    same frame data as their side mate; only one
-//                          pair lights at a time. A DIR_A event runs the
-//                          chase forward on the SIDE_A pair (B pair stays
-//                          dark); a DIR_B event runs it in reverse on the
-//                          SIDE_B pair (A pair stays dark). Each pin is
-//                          routed through a 74AHCT125 (5V) buffer before
-//                          reaching its strip.
-//                          Valid Teensy 4.0 WS2812Serial pins: 1 (Serial1,
-//                          taken by RS485), 8 (Serial2), 14 (Serial3),
-//                          17 (Serial4), 20 (Serial5), 24 (Serial6),
-//                          29 (Serial7), 39 (Serial8).
-//   PIN_RS485_DE         - Tied to MAX3485 DE+RE; toggled automatically by
-//                          Serial1.transmitterEnable().
-#define PIN_LED_STRIP_A1   8
-#define PIN_LED_STRIP_A2  14
-#define PIN_LED_STRIP_B1  17
-#define PIN_LED_STRIP_B2  20
-#define PIN_RS485_DE       6
+//   PIN_LED_STRIP_A1/A2  - SIDE_A LED strip pair (GPIO 6/7 on this install).
+//   PIN_LED_STRIP_B1/B2  - SIDE_B pair (GPIO 8/9). Driven with Adafruit_NeoPixel
+//                          (any GPIO). show() briefly masks interrupts; RS485 RX
+//                          relies on the Serial1 hardware FIFO during LED updates.
+//   Serial1 (RS485): RX=0, TX=1, DE+RE=2 (PIN_RS485_DE). DE/RE must not
+//   overlap LED data pins 6..9.
+#define PIN_LED_STRIP_A1  6
+#define PIN_LED_STRIP_A2  7
+#define PIN_LED_STRIP_B1  8
+#define PIN_LED_STRIP_B2  9
+#define PIN_RS485_DE      2    // MAX3485 DE+RE tied together; Serial1.transmitterEnable()
 
 // ---- RS485 ----------------------------------------------------------
 #define RS485_BAUD        115200
 
 // Each event is sent on the bus this many times with random jitter
-// between sends, to mitigate rare collisions. The Pi dedupes by (id, seq).
+// between sends, to mitigate rare collisions. The audio node dedupes by (id, seq).
 #define RS485_RESEND_COUNT          2
 #define RS485_RESEND_JITTER_MIN_MS  5
 #define RS485_RESEND_JITTER_MAX_MS  25

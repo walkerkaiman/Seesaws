@@ -22,12 +22,13 @@ This is the per-seesaw Arduino sketch. Every seesaw runs identical code; only `S
 External libraries (install once via **Arduino IDE -> Library Manager**):
 
 - **`Adafruit MPU6050`** - MPU6050 driver
-- **`Adafruit Unified Sensor`** - dependency of the above (the IDE will offer to pull it in automatically)
+- **`Adafruit NeoPixel`** - WS2813 strips on GPIO 6/7/8/9 (any-pin bit-bang; `show()` briefly masks interrupts)
+- **`Adafruit Unified Sensor`** - dependency of the MPU6050 library
 - (`Adafruit BusIO` may also be pulled in as a transitive dependency)
 
 The MPU6050 replaces a mechanical tilt switch and is read in **gyroscope** mode: the firmware watches for direction reversals (the moment the seesaw bottoms out and starts coming back up) instead of crossing an absolute angle threshold. This makes triggers feel responsive at any amplitude, so a small kid rocking the seesaw a few degrees and an adult swinging through 30 degrees both fire events at the impact moment.
 
-**`WS2812Serial`** is bundled with Teensyduino, no separate install. It's chosen over `Adafruit_NeoPixel` because it uses DMA and does **not** disable interrupts during writes, so RS485 RX bytes are never lost while the LEDs update. **`Wire`** is the standard Arduino I2C library and is also bundled.
+**`Wire`** is the standard Arduino I2C library and is bundled with Teensyduino. LED updates use NeoPixel because this install's data lines are fixed on GPIO **6, 7, 8, 9** (not the UART TX pins required by `WS2812Serial`). Serial1's hardware RX FIFO covers RS485 during the short `show()` windows.
 
 ## Pin map
 
@@ -43,10 +44,10 @@ The MPU6050 replaces a mechanical tilt switch and is read in **gyroscope** mode:
 | LED strip B2 data (SIDE_B pair) | 20 (`PIN_LED_STRIP_B2`) | Through 74AHCT125 5V buffer + 470 ohm |
 | RS485 RX | 0 (`Serial1` RX) | from MAX3485 RO |
 | RS485 TX | 1 (`Serial1` TX) | to MAX3485 DI |
-| RS485 DE/RE | 6 (`PIN_RS485_DE`) | tied to MAX3485 DE+RE; toggled automatically |
+| RS485 DE/RE | 2 (`PIN_RS485_DE`) | tied to MAX3485 DE+RE; toggled automatically |
 | 5 V power in | VIN | from per-seesaw 24V to 5V buck output (cut VIN/VUSB pad if also using USB) |
 
-`WS2812Serial` only works on Serial-TX-capable pins on Teensy 4.0: `1, 8, 14, 17, 20, 24, 29, 39`. Pin 1 is taken by `Serial1` (RS485), so we use 8 / 14 for the SIDE_A pair and 17 / 20 for the SIDE_B pair. Each pin drives its own physical strip. Only the pair on the side that bottomed out animates per event; the two pins in that pair receive identical data so the two strips on that side stay in lock-step, and the pair on the other side is held dark for the chase. To change pins, pick any other four pins from that list and update `config.h`.
+This install drives strips with **`Adafruit_NeoPixel`** on GPIO **6, 7, 8, 9** (fixed wiring). RS485 is **Serial1**: RX pin 0, TX pin 1, DE+RE pin 2. Change pins in `config.h` only if your harness differs.
 
 The MPU6050's I2C pull-ups are already on the breakout board, so no external pull-up resistors are needed. If you ever stack a second I2C device on the same bus, leave only one set of pull-ups in circuit.
 
@@ -101,7 +102,7 @@ flowchart LR
     Shifter -->|"DIN"| StripA2
     Shifter -->|"DIN"| StripB1
     Shifter -->|"DIN"| StripB2
-    Teensy <-->|"pin 0 RX, pin 1 TX, pin 6 DE+RE"| XCVR
+    Teensy <-->|"pin 0 RX, pin 1 TX, pin 2 DE+RE"| XCVR
     XCVR <--> RA
     XCVR <--> RB
 ```
@@ -113,7 +114,7 @@ A short way to read this:
 - The **local 5 V output** powers the LED strips, the level shifter, and the Teensy's `VIN`. The strips never see the trunk voltage, so trunk drop doesn't matter for color stability.
 - The **Teensy's onboard 3V3 regulator** powers the MAX3485 transceiver and the MPU6050. Both draw a few mA combined, well within the 3V3 rail's budget.
 - The **74AHCT125** sits between the Teensy data pins and the strips so the WS2813s see clean 5 V edges. It's a quad buffer, so a single chip handles all four LED data lines.
-- The **MAX3485** sits between the Teensy's `Serial1` and the RS485 bus. DE/RE is on pin 6 and is toggled automatically by `Serial1.transmitterEnable()`.
+- The **MAX3485** sits between the Teensy's `Serial1` and the RS485 bus. DE/RE is on pin 2 and is toggled automatically by `Serial1.transmitterEnable()`.
 - The **GND wire on the RS485 cable, the 24 V return, and the buck's GND reference are all the same conductor** - one shared GND ties everything together.
 
 ## Per-seesaw configuration
@@ -124,7 +125,7 @@ Before flashing each board, edit [Seesaw/config.h](Seesaw/config.h):
 #define SEESAW_ID 1   // unique 1..255 across the bus
 ```
 
-`SEESAW_ID` must match an entry in `Audio/config.yaml` on the Pi for any sound to play.
+`SEESAW_ID` must match the numeric prefix in the audio SD filenames (`sounds/{SEESAW_ID}_A.wav` and `sounds/{SEESAW_ID}_B.wav` on the central Teensy).
 
 Other settings that you typically only set once for the whole installation:
 
@@ -141,7 +142,7 @@ Other settings that you typically only set once for the whole installation:
 | `TILT_EVENT_COOLDOWN_MS` | 150 | Suppress further events for this long after firing one |
 | `TILT_SAMPLE_INTERVAL_MS` | 10 | Gyro poll period (100 Hz) |
 | `MPU_I2C_ADDR` | 0x68 | 0x68 default; 0x69 if you've tied AD0 high |
-| `RS485_BAUD` | 115200 | Must match `serial.baud` in the Pi config |
+| `RS485_BAUD` | 115200 | Must match `RS485_BAUD` in `Audio/SeesawAudio/config.h` |
 | `RS485_RESEND_COUNT` | 2 | Times each event is sent on the bus |
 | `RS485_RESEND_JITTER_MIN_MS` / `_MAX_MS` | 5 / 25 | Random gap between resends |
 
@@ -210,7 +211,7 @@ Notes:
 - The transition from PLAY back to IDLE only fires once the active chase has finished playing - the system never yanks an in-progress chase to switch modes.
 - `idleTimer` resets to zero on every tilt event, regardless of current state. So holding the seesaw in active use indefinitely keeps it in PLAY; releasing it for `IDLE_TIMEOUT_MS` returns to IDLE.
 - Setting `IDLE_TIMEOUT_MS` very low (e.g. 1000) makes the idle animation start only ~1 s after each play chase - useful while authoring an idle animation. Setting it very high (e.g. 86400000 = 24 h) effectively disables the idle mode in normal use.
-- Every state transition emits a state-change event on RS485 (`EVT_STATE_IDLE` = wire byte 3 value `2`, `EVT_STATE_PLAY` = `3`), including the boot-into-IDLE transition. On the IDLE -> PLAY transition the state event goes out *before* the tilt event that caused it. The Pi audio player has a no-op listener stub for these (see [Audio/README.md](../Audio/README.md#state-change-events-idleplay)) so today they only get logged, but the wire path is in place for idle-aware audio behavior later without another firmware change.
+- Every state transition emits a state-change event on RS485 (`EVT_STATE_IDLE` = wire byte 3 value `2`, `EVT_STATE_PLAY` = `3`), including the boot-into-IDLE transition. On the IDLE -> PLAY transition the state event goes out *before* the tilt event that caused it. The central audio Teensy has a no-op listener stub for these (see [Audio/README.md](../Audio/README.md#state-change-events-idleplay)) so today they only get logged on USB Serial, but the wire path is in place for idle-aware audio behavior later without another seesaw firmware change.
 
 ## Animation data workflow (chase + idle)
 
@@ -277,7 +278,7 @@ When you move to the next seesaw, change `SEESAW_ID` and upload again.
 
 ## Troubleshooting
 
-- **LEDs work but show wrong colors** -> the strips might not be in `WS2811_GRB` order. WS2813 is normally GRB; if yours is RGB, change the `WS2812Serial` constructor in `Seesaw.ino` from `WS2811_GRB` to `WS2811_RGB`.
+- **LEDs work but show wrong colors** -> WS2813 is normally GRB. If yours is RGB, change `NEO_GRB` to `NEO_RGB` in the `LedStrip` constructor in `Seesaw.ino`.
 - **First LED stutters or wrong color, rest are fine** -> add the 1000 uF cap and 470 ohm resistor in series with data, and confirm common ground between the Teensy and strip PSU.
 - **No tilt events at all / boots silent** -> the MPU6050 might not be initialising. Confirm SDA/SCL aren't swapped, that the breakout is powered (3V3 + GND), and that `MPU_I2C_ADDR` matches your module (most are 0x68; some pull AD0 high and become 0x69). The firmware deliberately silences all events if `mpu.begin()` fails so a bad sensor doesn't flood the bus.
 - **Tilt fires for the wrong direction** -> set `TILT_INVERT = true` in `config.h` (or the other way around).
@@ -286,5 +287,5 @@ When you move to the next seesaw, change `SEESAW_ID` and upload again.
 - **Tilt fires from random vibration / footsteps** -> raise `TILT_MIN_VELOCITY_DPS` (try 25-30 dps).
 - **Chase keeps restarting on fast rocking** -> raise `TILT_EVENT_COOLDOWN_MS` (try 300-500 ms) so the chase has more time to play between events.
 - **Latency feels too high between reversal and event** -> shorten `TILT_SAMPLE_INTERVAL_MS` (try 5 ms / 200 Hz). 100 Hz is already responsive; sub-10 ms latency is hard to perceive.
-- **Pi never receives anything** -> confirm bus termination (120 ohm at both ends, **not** every node), bias resistors at the Pi end, and that A/B aren't swapped. The Teensy's onboard LED is not driven by this firmware so it is not a status indicator - watch the Pi log instead. You can use any USB-serial sniffer to read the bus directly to confirm bytes are coming out of the transceiver.
-- **Pi receives garbage / CRC failures** -> baud mismatch, no bus termination, or A/B swapped on one node. Verify both ends of the cable.
+- **Audio node never receives anything** -> confirm bus termination (120 ohm at both ends, **not** every node), bias resistors at the rack end, and that A/B aren't swapped. Watch USB Serial on the audio Teensy (115200 baud) for `Playing sounds/...` lines. You can use any USB-serial sniffer on the bus to confirm bytes are coming out of the transceiver.
+- **CRC mismatch on audio Teensy** -> baud mismatch, no bus termination, or A/B swapped on one node. Verify both ends of the cable.

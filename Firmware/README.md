@@ -4,11 +4,12 @@ This is the per-seesaw Arduino sketch. Every seesaw runs identical code; only `S
 
 ## Layout
 
-- [Seesaw/Seesaw.ino](Seesaw/Seesaw.ino) - main sketch (`setup` + `loop`, tilt detection, idle/play state machine, chase + idle playback, RS485 transmit including state-change events)
-- [Seesaw/config.h](Seesaw/config.h) - `SEESAW_ID`, FPS, pins, baud, tilt thresholds, idle timeout, idle frame offsets, retry settings
+- [Seesaw/Seesaw.ino](Seesaw/Seesaw.ino) - main sketch (`setup` + `loop`, tilt detection, idle/play state machine, chase + noise-idle playback, RS485 transmit including state-change events)
+- [Seesaw/config.h](Seesaw/config.h) - `SEESAW_ID`, FPS, pins, baud, tilt thresholds, idle timeout, idle noise tuning, retry settings
 - [Seesaw/protocol.h](Seesaw/protocol.h) - 6-byte RS485 frame format and CRC-8 (defines tilt and state-change event codes)
 - [Seesaw/chase.h](Seesaw/chase.h) - paste-in **play-mode** chase animation data
-- [Seesaw/idle.h](Seesaw/idle.h) - paste-in **idle-mode** chase animation data (looped on all four strips when there's no recent activity)
+- [Seesaw/idle_noise.h](Seesaw/idle_noise.h) - procedural grayscale 3D noise sampler used for idle mode (FastLED `inoise8`)
+- [Seesaw/idle.h](Seesaw/idle.h) - stub. The default firmware does NOT use this; idle is procedural noise. The `csv_to_header.py --target idle` tool still writes here for users who prefer baked CSV idle.
 - [tools/csv_to_header.py](tools/csv_to_header.py) - converts a play or idle CSV into `chase.h` / `idle.h`
 
 ## Required tooling
@@ -23,6 +24,7 @@ External libraries (install once via **Arduino IDE -> Library Manager**):
 
 - **`Adafruit MPU6050`** - MPU6050 driver
 - **`Adafruit NeoPixel`** - WS2813 strips on GPIO 6/7/8/9 (any-pin bit-bang; `show()` briefly masks interrupts)
+- **`FastLED`** - only used for `inoise8(x, y, z)` in the idle-mode noise renderer. No FastLED controllers are registered; strip output stays on NeoPixel.
 - **`Adafruit Unified Sensor`** - dependency of the MPU6050 library
 - (`Adafruit BusIO` may also be pulled in as a transitive dependency)
 
@@ -131,11 +133,16 @@ Other settings that you typically only set once for the whole installation:
 
 | Constant | Default | Meaning |
 |---|---|---|
-| `STRIP_NUM_LEDS` | 45 | LEDs per physical WS2813 strip. All four strips are this length. Must be `>=` `CHASE_NUM_LEDS` and `IDLE_NUM_LEDS` |
+| `STRIP_NUM_LEDS` | 45 | LEDs per physical WS2813 strip. All four strips are this length. Must be `>=` `CHASE_NUM_LEDS` |
 | `CHASE_FPS` | 30 | Play-mode chase frame rate |
-| `IDLE_FPS` | 15 | Idle-mode animation frame rate (independent of `CHASE_FPS`) |
+| `IDLE_FPS` | 30 | Idle noise sample rate (each tick advances `idleNoiseZ` and redraws every pixel) |
 | `IDLE_TIMEOUT_MS` | 60000 | Time without a tilt event before the seesaw drops back from PLAY to IDLE |
-| `IDLE_FRAME_OFFSET_A1/A2/B1/B2` | `0`, `N/4`, `N/2`, `3N/4` of `IDLE_NUM_FRAMES` | Per-strip frame offsets for the idle wave. Set both pins on a side to the same value if you want that side's pair to stay in lock-step |
+| `IDLE_NOISE_Z_STEP` | 4 | How far the noise time axis advances per idle tick. Smaller = slower drift |
+| `IDLE_NOISE_X_SCALE` | 40 | Noise-space gap between adjacent LEDs. <20 = neighbors look identical (uniform smear); 30..50 = visible per-LED variation in soft blobs; >80 = sparkly per-pixel noise |
+| `IDLE_NOISE_Y_STRIDE` | 192 | Noise-space gap between adjacent strips. 0 makes all four strips identical; >=128 makes them effectively independent |
+| `IDLE_NOISE_Y_BASE` | 0 | Constant added to y for strip 0 (slides the whole pattern across) |
+| `IDLE_NOISE_PER_ID_OFFSET` | 73 | Per-seesaw spatial bias so neighboring seesaws don't render identically |
+| `IDLE_NOISE_FLOOR` / `_CEIL` | 60 / 190 | Contrast stretch. inoise8 clusters samples in this range; the renderer remaps it to 0..255 so the field reaches fully dark and fully bright. Set 0 / 255 to disable |
 | `TILT_GYRO_AXIS` | `TILT_GYRO_AXIS_Y` | Which MPU6050 gyro axis is the seesaw's *rotation* axis (perpendicular to length, see below) |
 | `TILT_INVERT` | `false` | Flip the sign if your mounting gives positive velocity for SIDE_A motion |
 | `TILT_MIN_VELOCITY_DPS` | `15.0f` | Minimum angular velocity (deg/s) before motion is counted as real |
@@ -196,7 +203,7 @@ A small velocity dead zone around zero (`TILT_MIN_VELOCITY_DPS`) means gyro nois
 The firmware runs in one of two modes at any time:
 
 - **PLAY**: triggered by a tilt event. The play chase in `chase.h` runs **forward on the SIDE_A pair** for `DIR_A` and **reverse on the SIDE_B pair** for `DIR_B`. The pair on the non-triggered side stays dark, so feedback is localized to whichever side just hit the ground. A new tilt event (after the cooldown) interrupts the in-progress chase and may swap which pair is lit.
-- **IDLE**: the seesaw boots into this mode and falls back to it after `IDLE_TIMEOUT_MS` (default 60 s) without a tilt event. The idle animation in `idle.h` plays continuously on **all four strips at once**, with each strip offset by `IDLE_FRAME_OFFSET_<strip>` frames so the strips animate phase-shifted (a wave across the seesaw).
+- **IDLE**: the seesaw boots into this mode and falls back to it after `IDLE_TIMEOUT_MS` (default 60 s) without a tilt event. Idle is a **procedural grayscale 3D noise field** (FastLED `inoise8`, see [Seesaw/idle_noise.h](Seesaw/idle_noise.h)). Every `1 / IDLE_FPS` seconds the renderer advances `idleNoiseZ` by `IDLE_NOISE_Z_STEP` and resamples every (strip, LED) pixel as `r = g = b = inoise8(x, y, z) * (LED_BRIGHTNESS / 255)`. Because `z` is a `uint16_t` and `inoise8` is continuous across wraps, the animation runs forever without a visible repeat.
 
 ```mermaid
 stateDiagram-v2
@@ -213,29 +220,21 @@ Notes:
 - Setting `IDLE_TIMEOUT_MS` very low (e.g. 1000) makes the idle animation start only ~1 s after each play chase - useful while authoring an idle animation. Setting it very high (e.g. 86400000 = 24 h) effectively disables the idle mode in normal use.
 - Every state transition emits a state-change event on RS485 (`EVT_STATE_IDLE` = wire byte 3 value `2`, `EVT_STATE_PLAY` = `3`), including the boot-into-IDLE transition. On the IDLE -> PLAY transition the state event goes out *before* the tilt event that caused it. The central audio Teensy has a no-op listener stub for these (see [Audio/README.md](../Audio/README.md#state-change-events-idleplay)) so today they only get logged on USB Serial, but the wire path is in place for idle-aware audio behavior later without another seesaw firmware change.
 
-## Animation data workflow (chase + idle)
+## Animation data workflow (play chase)
 
-There are two animation files in `Firmware/Seesaw/`: `chase.h` for the play chase and `idle.h` for the idle animation. Both have the same on-disk layout and are produced by the same `csv_to_header.py` tool.
-
-The play chase in `chase.h` is one animation: the sketch plays it forward on the SIDE_A pair when SIDE_A bottoms out, and in reverse on the SIDE_B pair when SIDE_B bottoms out (only the triggered side lights up).
-
-The idle animation in `idle.h` is also one animation, played simultaneously on all four strips when the seesaw is idle. Each strip is offset by `IDLE_FRAME_OFFSET_<strip>` frames (set in `config.h`) so the strips animate phase-shifted; the animation loops indefinitely until a tilt event drops it.
+The play chase lives in [Seesaw/chase.h](Seesaw/chase.h) and is produced by [tools/csv_to_header.py](tools/csv_to_header.py). The sketch plays it forward on the SIDE_A pair when SIDE_A bottoms out, and in reverse on the SIDE_B pair when SIDE_B bottoms out (only the triggered side lights up).
 
 ### Option 1 - generate from CSV (recommended)
 
-Author each animation in your tool of choice and export to CSV with one row per frame and `R,G,B,R,G,B,...` per LED. Then run the tool with the matching `--target`:
+Author the chase in your tool of choice and export to CSV with one row per frame and `R,G,B,R,G,B,...` per LED. Then run:
 
 ```bash
-# Play chase -> Firmware/Seesaw/chase.h
 python Firmware/tools/csv_to_header.py path/to/chase.csv
-
-# Idle animation -> Firmware/Seesaw/idle.h
-python Firmware/tools/csv_to_header.py path/to/idle.csv --target idle
 ```
 
-That regenerates the matching header (`chase.h` or `idle.h`) with the correct `<PREFIX>_NUM_LEDS` and `<PREFIX>_NUM_FRAMES` and the data baked in. The tool prints which file it wrote and the PROGMEM size. Override the destination with `-o` if you need to.
+That regenerates `Firmware/Seesaw/chase.h` with the correct `CHASE_NUM_LEDS` and `CHASE_NUM_FRAMES` and the data baked in. The tool prints which file it wrote and the PROGMEM size. Override the destination with `-o` if you need to.
 
-CSV rules (same for both targets):
+CSV rules:
 
 - One row per frame; all rows must have the same length.
 - Length must be a multiple of 3; the LED count is auto-detected as `columns / 3`.
@@ -253,18 +252,39 @@ Example for 4 LEDs, 3 frames (a red dot moving from LED 0 to LED 2):
 
 ### Option 2 - paste manually
 
-Open `Firmware/Seesaw/chase.h` (or `idle.h`), set `CHASE_NUM_LEDS` / `CHASE_NUM_FRAMES` (or `IDLE_NUM_LEDS` / `IDLE_NUM_FRAMES`), then replace the rows between the `BEGIN .. DATA` / `END .. DATA` markers. Each row must be `{ r,g,b, r,g,b, ... }` with `<PREFIX>_NUM_LEDS` triplets.
+Open `Firmware/Seesaw/chase.h`, set `CHASE_NUM_LEDS` / `CHASE_NUM_FRAMES`, then replace the rows between the `BEGIN CHASE DATA` / `END CHASE DATA` markers. Each row must be `{ r,g,b, r,g,b, ... }` with `CHASE_NUM_LEDS` triplets.
 
-Both `CHASE_NUM_LEDS` and `IDLE_NUM_LEDS` must be `<=` `STRIP_NUM_LEDS` from `config.h`; `static_assert`s in `Seesaw.ino` enforce this. Any LEDs past the chosen width simply stay dark.
+`CHASE_NUM_LEDS` must be `<=` `STRIP_NUM_LEDS` from `config.h`; a `static_assert` in `Seesaw.ino` enforces this. Any LEDs past the chosen width are tiled (the chase repeats every `CHASE_NUM_LEDS` pixels).
 
 ### Placeholder behavior
 
-- `chase.h`: a single red pixel walking across 5 LEDs over 5 frames - a useful first sanity check on the bench. Tilt the seesaw one way and the dot moves left to right on the triggered side's pair; tilt the other way and it moves right to left on the other pair. With the default `STRIP_NUM_LEDS = 45`, only the first five LEDs of the active pair light up under this placeholder.
-- `idle.h`: a slow red breath - all 5 LEDs ramp up and back down over 8 frames. With the default per-strip offsets in `config.h` (`0`, `2`, `4`, `6`), the four strips will breathe out of phase, so on the bench you see the wave effect immediately.
+`chase.h` ships with a single red pixel walking across 5 LEDs over 5 frames - a useful first sanity check on the bench. With the default `STRIP_NUM_LEDS = 45`, that 5-pixel pattern tiles nine times across the active pair.
+
+## Idle animation (procedural noise)
+
+Idle mode does not use a baked CSV. It samples [Seesaw/idle_noise.h](Seesaw/idle_noise.h)'s `sampleIdleNoise(stripIndex, ledIndex, idleNoiseZ)` for every pixel on every idle tick, with `idleNoiseZ` advancing by `IDLE_NOISE_Z_STEP` each frame.
+
+Tune in [Seesaw/config.h](Seesaw/config.h):
+
+- `IDLE_FPS` (default 30) - sample rate. 30 is the smoothest, but Teensy 4.0 has lots of headroom if you want more.
+- `IDLE_NOISE_Z_STEP` (default 4) - time drift speed. 1 is barely moving; 4-6 is the "slow but visibly drifting" sweet spot at 30 FPS; 10+ is fast.
+- `IDLE_NOISE_X_SCALE` (default 40) - noise-space gap between adjacent LEDs. **This is the knob to tweak first if the strip looks like solid color.** `inoise8`'s feature length is ~64-128 noise units, so X_SCALE values below 20 sample the same blob across many LEDs (no visible variation). 30-50 gives clearly distinct LEDs that group into ~3-5-LED soft blobs. >80 looks like sparkly per-pixel static.
+- `IDLE_NOISE_Y_STRIDE` (default 192) - how out-of-phase adjacent strips look. 0 makes all four strips identical; 128+ makes them effectively independent.
+- `IDLE_NOISE_Y_BASE` (default 0) - slides the whole pattern across.
+- `IDLE_NOISE_PER_ID_OFFSET` (default 73) - per-seesaw spatial bias multiplied by `SEESAW_ID`, so neighboring seesaws don't render the same field.
+- `IDLE_NOISE_FLOOR` / `IDLE_NOISE_CEIL` (default 60 / 190) - contrast stretch. `inoise8` rarely returns values outside this range, so the renderer remaps `[FLOOR..CEIL]` to `[0..255]` (saturating outside). Without this stretch every pixel sits in the bright midrange and the strip reads as solid warm white. Set FLOOR=0 and CEIL=255 to disable.
+
+Output is grayscale - `r = g = b = stretched_sample`, after `LED_BRIGHTNESS` scaling. Change `setPixel(i, v, v, v)` in `drawIdleNoise()` if you ever want to map the sample through a palette.
+
+`idleNoiseZ` is **not** reset across PLAY -> IDLE transitions, so the field appears continuous across a play chase. Call `resetIdleNoise()` in `enterIdleState()` if you want a fixed restart point per idle session.
+
+### Going back to CSV idle (advanced)
+
+If you need a baked CSV idle animation, run `python Firmware/tools/csv_to_header.py path/to/idle.csv --target idle` to overwrite [Seesaw/idle.h](Seesaw/idle.h), then re-add `#include "idle.h"` and the previous CSV-based renderer to `Seesaw.ino`. The stub `idle.h` in this repo documents what to do.
 
 ### Memory note
 
-Both animations live in `PROGMEM` (Teensy 4.0 has 2 MB of flash). Storage cost is `<PREFIX>_NUM_LEDS * 3 * <PREFIX>_NUM_FRAMES` bytes per animation - e.g. 45 LEDs at 5 s @ 30 FPS = ~20 KB for the play chase, plus a similar bit for the idle. There is only one copy of each animation in flash; idle plays the same data on all four strips with index offsets, and the play chase plays the same data forward or reverse on whichever pair fired.
+`chase.h` lives in `PROGMEM`. Storage cost is `CHASE_NUM_LEDS * 3 * CHASE_NUM_FRAMES` bytes - e.g. 45 LEDs at 5 s @ 30 FPS = ~20 KB. Idle uses no PROGMEM (the noise sampler is `~6 KB` of FastLED code total).
 
 ## Build and flash
 

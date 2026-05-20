@@ -29,9 +29,10 @@
 // The seesaw runs in one of two modes at any time:
 //   - PLAY: triggered by a tilt event; runs the chase in chase.h on
 //     the pair of strips on the side that just bottomed out.
-//   - IDLE: continuously loops the idle animation in idle.h on all
-//     four strips with a per-strip frame offset, so the four strips
-//     animate phase-shifted.
+//   - IDLE: continuously samples a procedural grayscale 3D noise field
+//     (FastLED inoise8) on all four strips. The noise field's z axis
+//     advances slowly each frame, so the animation can run forever
+//     without a visible loop or repeat.
 //
 // Boot starts in IDLE so the seesaw shows the idle animation
 // immediately on power-up. After IDLE_TIMEOUT_MS without a tilt event,
@@ -39,34 +40,59 @@
 // instantly returns it to PLAY.
 
 // Time (ms) without a tilt event before reverting from PLAY to IDLE.
-// Default 60000 ms = 60 seconds.
-#define IDLE_TIMEOUT_MS  60000
+// Default 6000 ms = 6 seconds.
+#define IDLE_TIMEOUT_MS  6000
 
-// Idle animation frame rate (frames per second). Independent of
-// CHASE_FPS so you can have a slow breathing idle and a fast play
-// chase, or vice versa.
-#define IDLE_FPS         15
+// Idle animation frame rate (frames per second). 30 is the design target
+// for the procedural noise idle (smooth drift). Independent of CHASE_FPS.
+#define IDLE_FPS         30
 
-// Per-strip frame offsets for the idle animation. Each strip displays
-// the idle chase but shifted by this many frames (modulo IDLE_NUM_FRAMES
-// from idle.h), creating a phase-shifted wave across the four strips.
-// The defaults divide the cycle into quarters between A1, A2, B1, B2;
-// override here if you want a different idle pattern (e.g. set both
-// pins on a side to the same offset to keep the pair in lock-step).
-#define IDLE_FRAME_OFFSET_A1  0
-#define IDLE_FRAME_OFFSET_A2  ((IDLE_NUM_FRAMES * 1) / 4)
-#define IDLE_FRAME_OFFSET_B1  ((IDLE_NUM_FRAMES * 2) / 4)
-#define IDLE_FRAME_OFFSET_B2  ((IDLE_NUM_FRAMES * 3) / 4)
+// ---- Idle noise tuning (see idle_noise.h) --------------------------
+//
+// IDLE_NOISE_Z_STEP    z-axis (time) advance per idle tick. Smaller =
+//                      slower drift. At IDLE_FPS=30 a step of 4 means
+//                      noise features pass roughly every ~0.5 s.
+// IDLE_NOISE_X_SCALE   noise-space gap between adjacent LEDs. Too small
+//                      (<20) and neighbors look identical (smooth blob);
+//                      too large (>80) and the strip looks like static
+//                      sparkle. inoise8's feature length is ~64-128
+//                      units, so 30..50 gives clearly distinct pixels
+//                      that still group into visible blobs of ~3-5 LEDs.
+// IDLE_NOISE_Y_STRIDE  noise-space gap between adjacent strips. 0 makes
+//                      all four strips identical. >=128 makes them look
+//                      effectively independent.
+// IDLE_NOISE_Y_BASE    constant added to y for strip 0. Use to slide
+//                      the whole pattern across without changing speed.
+// IDLE_NOISE_PER_ID_OFFSET
+//                      per-seesaw spatial bias added to both x and y so
+//                      neighboring seesaws don't render identical
+//                      patterns at the same z. 0 disables.
+#define IDLE_NOISE_Z_STEP          8
+#define IDLE_NOISE_X_SCALE         20
+#define IDLE_NOISE_Y_STRIDE        192
+#define IDLE_NOISE_Y_BASE          0
+#define IDLE_NOISE_PER_ID_OFFSET   73
+
+// inoise8() output clusters in roughly IDLE_NOISE_FLOOR..IDLE_NOISE_CEIL
+// instead of spanning 0..255. Without this stretch, every pixel lives
+// in the bright midrange and the strip reads as solid warm white. The
+// renderer remaps [FLOOR..CEIL] -> [0..255] (saturating outside) so the
+// noise actually reaches both fully dark and fully bright.
+//
+// To disable the stretch, set FLOOR=0 and CEIL=255 (identity mapping).
+// CEIL must be strictly greater than FLOOR.
+#define IDLE_NOISE_FLOOR           80
+#define IDLE_NOISE_CEIL            150
 
 // Global LED brightness scaler, 0..255. Every R/G/B value coming out of
-// the chase data is multiplied by (LED_BRIGHTNESS / 255) before being
-// written to the strips, so 255 = full brightness (chase data unchanged)
-// and 0 = strips dark. Lower this to cap power draw or tame an
-// over-bright install without re-rendering the chase animation.
+// the chase data or noise sampler is multiplied by (LED_BRIGHTNESS/255)
+// before being written to the strips, so 255 = full brightness (data
+// unchanged) and 0 = strips dark. Lower this to cap power draw or tame
+// an over-bright install without re-rendering animations.
 //
 // Rough WS2813 power scaling at 5 V (per LED, full white frame):
 //   255 -> ~60 mA    192 -> ~45 mA    128 -> ~30 mA    64 -> ~15 mA
-#define LED_BRIGHTNESS 255
+#define LED_BRIGHTNESS 128
 
 // ---- USB Serial diagnostics -----------------------------------------
 //
@@ -79,7 +105,7 @@
 
 // At boot, flash every LED on all four strips (verifies wiring/power).
 // Set 0 once strips are confirmed working.
-#define BENCH_LED_SELFTEST          1
+#define BENCH_LED_SELFTEST          0
 
 // ---- Pin assignments (Teensy 4.0) -----------------------------------
 //

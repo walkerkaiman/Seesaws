@@ -53,7 +53,7 @@ AudioPlaySdWav *const kPlayers[MAX_VOICES] = {
 
 AudioMixer4 mixA;
 AudioMixer4 mixB;
-AudioMixer2 mixOut;
+AudioMixer4 mixOut;
 AudioOutputI2S audioOut;
 
 AudioConnection pc00(play0, 0, mixA, 0);

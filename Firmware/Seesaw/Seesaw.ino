@@ -10,11 +10,12 @@
 //
 // The firmware runs in one of two modes at any time:
 //
-//   IDLE: continuously loops the idle animation in idle.h on all four
-//         LED strips, with a configurable per-strip frame offset so
-//         the strips animate phase-shifted. Entered on boot, and re-
-//         entered automatically after IDLE_TIMEOUT_MS without a tilt
-//         event.
+//   IDLE: continuously samples a procedural grayscale 3D noise field
+//         (FastLED inoise8, see idle_noise.h) on all four LED strips.
+//         The noise z axis advances slowly each frame, so the idle
+//         animation runs indefinitely without a visible loop. Entered
+//         on boot and re-entered automatically after IDLE_TIMEOUT_MS
+//         without a tilt event.
 //
 //   PLAY: triggered by a tilt event. On every event the firmware:
 //         1. Sends a 6-byte event frame over RS485 (announcing this
@@ -59,12 +60,10 @@
 #include "config.h"
 #include "protocol.h"
 #include "chase.h"
-#include "idle.h"
+#include "idle_noise.h"
 
 static_assert(CHASE_NUM_LEDS <= STRIP_NUM_LEDS,
               "CHASE_NUM_LEDS must not exceed STRIP_NUM_LEDS");
-static_assert(IDLE_NUM_LEDS <= STRIP_NUM_LEDS,
-              "IDLE_NUM_LEDS must not exceed STRIP_NUM_LEDS");
 
 // ---- LED strips (Adafruit_NeoPixel on fixed GPIO 6/7/8/9) ------------
 //
@@ -134,21 +133,15 @@ elapsedMillis  frameTimer;
 const uint16_t FRAME_INTERVAL_MS = 1000 / CHASE_FPS;
 
 // ---- Idle animation (IDLE mode) ------------------------------------
+//
+// Procedural grayscale noise (see idle_noise.h). idleNoiseZ is the
+// shared time coordinate of the 3D noise field; it advances by
+// IDLE_NOISE_Z_STEP every idle tick (IDLE_FPS Hz). uint16_t wrap is
+// fine - inoise8 is continuous across the boundary.
 
-int            idleFrame = 0;                  // "lead" frame; per-strip
-                                               // frames are this + offset
+uint16_t       idleNoiseZ = 0;
 elapsedMillis  idleFrameTimer;
 const uint16_t IDLE_FRAME_INTERVAL_MS = 1000 / IDLE_FPS;
-
-const int      IDLE_FRAME_OFFSETS[] = {
-                 IDLE_FRAME_OFFSET_A1,
-                 IDLE_FRAME_OFFSET_A2,
-                 IDLE_FRAME_OFFSET_B1,
-                 IDLE_FRAME_OFFSET_B2,
-               };
-static_assert(sizeof(IDLE_FRAME_OFFSETS) / sizeof(IDLE_FRAME_OFFSETS[0])
-              == sizeof(allStrips) / sizeof(allStrips[0]),
-              "IDLE_FRAME_OFFSETS must have one entry per strip");
 
 // ---- RS485 ----------------------------------------------------------
 
@@ -175,24 +168,6 @@ static const char* motionDirName(MotionDir d) {
 
 static const char* systemStateName(SystemState s) {
   return (s == STATE_IDLE) ? "IDLE" : "PLAY";
-}
-
-static uint8_t idleFramePeakRgb(int frameIndex) {
-  uint8_t peak = 0;
-  for (int i = 0; i < (int)IDLE_NUM_LEDS; i++) {
-    peak = max(peak, pgm_read_byte(&idle[frameIndex][i * 3 + 0]));
-    peak = max(peak, pgm_read_byte(&idle[frameIndex][i * 3 + 1]));
-    peak = max(peak, pgm_read_byte(&idle[frameIndex][i * 3 + 2]));
-  }
-  return peak;
-}
-
-static uint8_t idleAnimPeakRgb() {
-  uint8_t peak = 0;
-  for (int f = 0; f < (int)IDLE_NUM_FRAMES; f++) {
-    peak = max(peak, idleFramePeakRgb(f));
-  }
-  return peak;
 }
 
 static void diagPrintPinWarnings() {
@@ -227,21 +202,23 @@ static void diagPrintBootBanner() {
   Serial.print(CHASE_NUM_LEDS);
   Serial.print('x');
   Serial.print(CHASE_NUM_FRAMES);
-  Serial.print(" IDLE=");
-  Serial.print(IDLE_NUM_LEDS);
-  Serial.print('x');
-  Serial.print(IDLE_NUM_FRAMES);
   Serial.print(" LED_BRIGHTNESS=");
   Serial.println(LED_BRIGHTNESS);
-  if (CHASE_NUM_LEDS < STRIP_NUM_LEDS || IDLE_NUM_LEDS < STRIP_NUM_LEDS) {
-    Serial.print("  NOTE: anim ");
-    Serial.print(IDLE_NUM_LEDS);
-    Serial.print("/");
+  if (CHASE_NUM_LEDS < STRIP_NUM_LEDS) {
+    Serial.print("  NOTE: chase ");
     Serial.print(CHASE_NUM_LEDS);
     Serial.print(" LEDs tiled across ");
     Serial.print(STRIP_NUM_LEDS);
     Serial.println("-pixel strips");
   }
+  Serial.print("idle: noise (inoise8) @ ");
+  Serial.print(IDLE_FPS);
+  Serial.print(" FPS, z_step=");
+  Serial.print(IDLE_NOISE_Z_STEP);
+  Serial.print(" x_scale=");
+  Serial.print(IDLE_NOISE_X_SCALE);
+  Serial.print(" y_stride=");
+  Serial.println(IDLE_NOISE_Y_STRIDE);
   Serial.print("MPU6050 @ 0x");
   Serial.print(MPU_I2C_ADDR, HEX);
   Serial.print(": ");
@@ -250,9 +227,9 @@ static void diagPrintBootBanner() {
     Serial.println("  Check I2C wiring (SDA=18, SCL=19), 3V3 power, ADDR pin.");
   }
   diagPrintPinWarnings();
-  Serial.print("idle peak RGB byte (brightest frame)=");
-  Serial.println(idleAnimPeakRgb());
-  Serial.println("After tilt: PLAY until 60s quiet, then IDLE animation resumes.");
+  Serial.print("After tilt: PLAY until ");
+  Serial.print(IDLE_TIMEOUT_MS);
+  Serial.println(" ms quiet, then noise idle resumes.");
   Serial.println("===================");
 }
 
@@ -265,8 +242,8 @@ static void diagPrintPeriodic() {
   Serial.print(chaseActive ? 1 : 0);
   Serial.print(" chaseFrame=");
   Serial.print(chaseFrame);
-  Serial.print(" idleFrame=");
-  Serial.println(idleFrame);
+  Serial.print(" noiseZ=");
+  Serial.println(idleNoiseZ);
 
   Serial.print("draws: idle=");
   Serial.print(diagIdleDraws);
@@ -275,7 +252,7 @@ static void diagPrintPeriodic() {
   Serial.print(" show=");
   Serial.println(diagShowCalls);
   if (diagIdleDraws == 0 && systemState == STATE_IDLE) {
-    Serial.println("  WARN: no idle draws yet - tickIdle/drawIdleFrame not running?");
+    Serial.println("  WARN: no idle draws yet - tickIdle/drawIdleNoise not running?");
   }
   if (diagShowCalls == 0) {
     Serial.println("  WARN: showStrips() never called - LEDs cannot update");
@@ -324,7 +301,8 @@ static void    startChase(uint8_t direction);
 static void    tickChase();
 static void    tickIdle();
 static void    drawFrame(int frameIndex);
-static void    drawIdleFrame();
+static void    drawIdleNoise();
+static void    resetIdleNoise();
 static void    clearStrips();
 static void    showStrips();
 #if BENCH_LED_SELFTEST
@@ -529,12 +507,12 @@ static void enterIdleState() {
   Serial.println("-> enterIdleState");
 #endif
   systemState = STATE_IDLE;
-  idleFrame = 0;
   idleFrameTimer = 0;
-  // tickIdle() will overwrite all pixels on its first call below; we
-  // don't need to clear here. Strips may already be dark from a
-  // chase-end clear, which is fine.
-  drawIdleFrame();
+  // idleNoiseZ is intentionally NOT reset here, so the noise field
+  // appears continuous across PLAY -> IDLE transitions. Call
+  // resetIdleNoise() instead if you want each idle session to start
+  // from a fixed point in the noise.
+  drawIdleNoise();
   sendEvent(EVT_STATE_IDLE);
 }
 
@@ -647,34 +625,40 @@ static void drawFrame(int frameIndex) {
 }
 
 // ---- Idle animation (IDLE mode) ------------------------------------
+//
+// Procedural grayscale 3D noise idle. Every IDLE_FPS tick we advance
+// idleNoiseZ by IDLE_NOISE_Z_STEP and resample the full pixel grid;
+// see idle_noise.h for the field layout. Output is grayscale
+// (r = g = b = noise sample, after LED_BRIGHTNESS scaling) so we get a
+// smooth drifting shimmer that never repeats.
 
 static void tickIdle() {
   if (idleFrameTimer < IDLE_FRAME_INTERVAL_MS) return;
   idleFrameTimer -= IDLE_FRAME_INTERVAL_MS;
 
-  idleFrame = (idleFrame + 1) % (int)IDLE_NUM_FRAMES;
-  drawIdleFrame();
+  idleNoiseZ = (uint16_t)(idleNoiseZ + (uint16_t)IDLE_NOISE_Z_STEP);
+  drawIdleNoise();
 }
 
-static void drawIdleFrame() {
+static void drawIdleNoise() {
 #if SERIAL_DIAG_ENABLE
   diagIdleDraws++;
 #endif
-  // Each strip plays the same idle animation but offset by its own
-  // IDLE_FRAME_OFFSETS[s] frames, so the four strips are phase-shifted.
-  // The animation loops indefinitely while the system is in IDLE.
   for (size_t s = 0; s < NUM_STRIPS; s++) {
-    int frame = (idleFrame + IDLE_FRAME_OFFSETS[s]) % (int)IDLE_NUM_FRAMES;
-    if (frame < 0) frame += (int)IDLE_NUM_FRAMES;   // safety if offset is negative
     for (int i = 0; i < (int)STRIP_NUM_LEDS; i++) {
-      const int src = i % (int)IDLE_NUM_LEDS;
-      uint8_t r = scaleBrightness(pgm_read_byte(&idle[frame][src * 3 + 0]));
-      uint8_t g = scaleBrightness(pgm_read_byte(&idle[frame][src * 3 + 1]));
-      uint8_t b = scaleBrightness(pgm_read_byte(&idle[frame][src * 3 + 2]));
-      allStrips[s]->setPixel(i, r, g, b);
+      uint8_t v = sampleIdleNoise((uint8_t)s, (uint16_t)i, idleNoiseZ);
+      v = scaleBrightness(v);
+      allStrips[s]->setPixel(i, v, v, v);
     }
   }
   showStrips();
+}
+
+// Defined but not called by default. Call from enterIdleState() if you
+// want each idle session to begin from a fixed point in the noise field.
+__attribute__((unused))
+static void resetIdleNoise() {
+  idleNoiseZ = 0;
 }
 
 static void clearStrips() {

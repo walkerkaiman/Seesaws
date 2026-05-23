@@ -2,11 +2,18 @@
 // Seesaw firmware (Teensy 4.0)
 // =====================================================================
 //
-// An MPU6050 measures the seesaw's angular velocity on the configured
-// rotation axis. Events fire on direction reversal - the moment one side
-// reaches its lowest point and starts coming back up. This is the impact
-// moment, and it works at any amplitude (small kids and adults trigger
-// the same way).
+// An MPU6050 measures the seesaw's tilt along its length axis using
+// the accelerometer. The signal is low-pass filtered, then run through
+// a three-zone state machine (NEUTRAL / A_DOWN / B_DOWN) with
+// hysteresis on the zone boundaries. Inside an active zone the
+// firmware tracks the running peak of the filtered signal and fires
+// the trigger only after the signal has backed off that peak by
+// TILT_REVERSAL_DELTA_G -- i.e. when the seesaw has actually started
+// reversing direction. An "armed-side" flag also enforces alternation:
+// once one side fires, the same side cannot fire again until the other
+// side fires, regardless of bounce or hand-jitter. See config.h for
+// the axis mapping, thresholds, and reversal delta, and pollTilt()
+// for the state machine.
 //
 // The firmware runs in one of two modes at any time:
 //
@@ -20,17 +27,16 @@
 //   PLAY: triggered by a tilt event. On every event the firmware:
 //         1. Sends a 6-byte event frame over RS485 (announcing this
 //            seesaw's ID and the new direction) to the central audio Teensy.
-//         2. Plays the chase animation on the pair of LED strips that
-//            lives on whichever side just bottomed out. DIR_A lights
-//            the SIDE_A pair (PIN_LED_STRIP_A1/A2) playing the chase
-//            forward; DIR_B lights the SIDE_B pair (PIN_LED_STRIP_B1/B2)
-//            playing it in reverse. The pair on the other side stays
-//            dark for the duration of the chase, so the visual
-//            feedback localizes to the side that just hit the ground.
-//         A new tilt event interrupts an in-progress chase (including
-//         swapping which pair is lit if the new event is on the
-//         opposite side), after a short cooldown so very fast bounces
-//         don't keep stomping on the chase.
+//         2. Starts that side's LED chase IF that side is not already
+//            chasing. DIR_A lights the SIDE_A pair (PIN_LED_STRIP_A1/A2)
+//            playing the chase forward; DIR_B lights the SIDE_B pair
+//            (PIN_LED_STRIP_B1/B2) playing it in reverse. Each side has
+//            its own independent chase pipeline, so a fast rocker can
+//            have both sides chasing concurrently. An in-progress chase
+//            is NEVER interrupted -- if a side's chase is already
+//            running when that side fires again, the bus event still
+//            goes out (so audio plays) but the LED chase keeps playing
+//            its current frame sequence to completion.
 //
 // In addition to tilt events, the firmware sends a state-change event
 // (EVT_STATE_IDLE / EVT_STATE_PLAY) on every IDLE<->PLAY transition,
@@ -47,7 +53,7 @@
 //   - MAX3485 (3.3V) on Serial1: RX pin 0, TX pin 1, DE+RE pin 2.
 //
 // Per-board configuration: edit SEESAW_ID in config.h before flashing.
-// Gyro axis, sampling rate, velocity threshold, and event cooldown also
+// Tilt axis, fire/release thresholds, LPF alpha, and zero offset also
 // live in config.h.
 // =====================================================================
 
@@ -100,15 +106,37 @@ LedStrip* const allStrips[] = { &ledsA1, &ledsA2, &ledsB1, &ledsB2 };
 const size_t   STRIPS_PER_SIDE = sizeof(stripsA)   / sizeof(stripsA[0]);
 const size_t   NUM_STRIPS      = sizeof(allStrips) / sizeof(allStrips[0]);
 
-// ---- Gyro / tilt state ---------------------------------------------
+// ---- Tilt detection state (MPU6050 accel peak-on-reversal) ---------
+//
+// The seesaw's tilt-along-length is read from the accelerometer axis
+// selected by TILT_AXIS_ACCEL (with TILT_INVERT_ACCEL flipping sign so
+// SIDE_A down maps to +g). The signal goes through a single-pole IIR
+// LPF; the filtered value drives a three-zone state machine (NEUTRAL /
+// A_DOWN / B_DOWN) with TILT_FIRE_THRESHOLD_G to enter a side and
+// TILT_RELEASE_THRESHOLD_G to leave it. Inside an active zone we track
+// the running peak and fire only once the signal has come back from
+// that peak by at least TILT_REVERSAL_DELTA_G -- i.e. the seesaw has
+// genuinely started reversing. An armed-side flag (NONE / A / B)
+// enforces alternation: the same side never fires twice in a row.
 
 Adafruit_MPU6050 mpu;
 bool           mpuOk = false;
 
-enum MotionDir { MOTION_NONE, MOTION_TOWARD_A, MOTION_TOWARD_B };
-MotionDir      motionDir = MOTION_NONE;
+enum TiltZone   { ZONE_NEUTRAL, ZONE_A_DOWN, ZONE_B_DOWN };
+enum ArmedSide  { ARM_NONE, ARM_A, ARM_B };
+
+static TiltZone  tiltZone         = ZONE_NEUTRAL;
+static ArmedSide tiltArmed        = ARM_NONE;
+static float     tiltFiltered     = 0.0f;    // LPF-filtered length-axis g
+static bool      tiltPrimed       = false;   // first sample seeds the LPF
+static float     tiltPeakG        = 0.0f;    // running peak (max in A_DOWN, min in B_DOWN); meaningless in NEUTRAL
+static bool      tiltFiredThisZone = false;  // becomes true after we fire in the current excursion
+static float     lastAccelX       = 0.0f;    // raw accel for diag, last poll
+static float     lastAccelY       = 0.0f;
+static float     lastAccelZ       = 0.0f;
+static float     lastGyroDps      = 0.0f;    // gyro along pivot, diag only
+
 elapsedMillis  sampleTimer;
-elapsedMillis  cooldownTimer;
 
 // ---- System state machine ------------------------------------------
 //
@@ -122,14 +150,22 @@ SystemState    systemState = STATE_IDLE;
 elapsedMillis  idleTimer;        // ms since the last tilt event
 
 // ---- Chase playback (PLAY mode) ------------------------------------
+//
+// One independent chase pipeline per side. Each tilt event starts that
+// side's chase IF that side isn't already running; an in-flight chase
+// is never interrupted. Both sides can run concurrently when the rider
+// rocks faster than a single chase plays out.
 
-enum ChaseSide { CHASE_ON_SIDE_A, CHASE_ON_SIDE_B };
+enum ChaseSide   { CHASE_SIDE_A = 0, CHASE_SIDE_B = 1, CHASE_NUM_SIDES = 2 };
 
-bool           chaseActive = false;
-int            chaseFrame  = 0;
-int            chaseStep   = 1;                // +1 forward, -1 reverse
-ChaseSide      chaseSide   = CHASE_ON_SIDE_A;  // which pair is currently lit
-elapsedMillis  frameTimer;
+struct ChaseState {
+  bool          active;
+  int           frame;
+  int           step;            // +1 forward, -1 reverse
+  elapsedMillis frameTimer;
+};
+static ChaseState chases[CHASE_NUM_SIDES];
+
 const uint16_t FRAME_INTERVAL_MS = 1000 / CHASE_FPS;
 
 // ---- Idle animation (IDLE mode) ------------------------------------
@@ -141,6 +177,7 @@ const uint16_t FRAME_INTERVAL_MS = 1000 / CHASE_FPS;
 
 uint16_t       idleNoiseZ = 0;
 elapsedMillis  idleFrameTimer;
+elapsedMillis  idleFadeTimer;       // ms since the most recent enterIdleState()
 const uint16_t IDLE_FRAME_INTERVAL_MS = 1000 / IDLE_FPS;
 
 // ---- RS485 ----------------------------------------------------------
@@ -151,18 +188,34 @@ uint8_t        txSeq = 0;
 
 #if SERIAL_DIAG_ENABLE
 static elapsedMillis diagTimer;
-static uint32_t      diagIdleDraws   = 0;
-static uint32_t      diagChaseDraws    = 0;
-static uint32_t      diagShowCalls     = 0;
-static uint32_t      diagTiltEvents    = 0;
-static uint32_t      diagRs485Events   = 0;
-static float         diagLastGyroDps   = 0.0f;
+static uint32_t      diagIdleDraws    = 0;
+static uint32_t      diagChaseDraws   = 0;
+static uint32_t      diagShowCalls    = 0;
+static uint32_t      diagTiltEvents   = 0;
+static uint32_t      diagRs485Events  = 0;
 
-static const char* motionDirName(MotionDir d) {
-  switch (d) {
-    case MOTION_TOWARD_A: return "TOWARD_A";
-    case MOTION_TOWARD_B: return "TOWARD_B";
-    default:              return "NONE";
+static const char* tiltZoneName(TiltZone z) {
+  switch (z) {
+    case ZONE_A_DOWN: return "A_DOWN";
+    case ZONE_B_DOWN: return "B_DOWN";
+    default:          return "NEUTRAL";
+  }
+}
+
+static const char* armedSideName(ArmedSide a) {
+  switch (a) {
+    case ARM_A: return "A";
+    case ARM_B: return "B";
+    default:    return "NONE";
+  }
+}
+
+static char accelAxisLetter(int axis) {
+  switch (axis) {
+    case TILT_AXIS_X: return 'X';
+    case TILT_AXIS_Y: return 'Y';
+    case TILT_AXIS_Z: return 'Z';
+    default:          return '?';
   }
 }
 
@@ -226,6 +279,24 @@ static void diagPrintBootBanner() {
   if (!mpuOk) {
     Serial.println("  Check I2C wiring (SDA=18, SCL=19), 3V3 power, ADDR pin.");
   }
+  Serial.print("tilt: accel axis=");
+  Serial.print(accelAxisLetter(TILT_AXIS_ACCEL));
+  Serial.print(TILT_INVERT_ACCEL ? " (inverted)" : "");
+  Serial.print(", zone-enter=");
+  Serial.print(TILT_FIRE_THRESHOLD_G, 2);
+  Serial.print(" g, reversal-delta=");
+  Serial.print(TILT_REVERSAL_DELTA_G, 2);
+  Serial.print(" g, zone-exit=");
+  Serial.print(TILT_RELEASE_THRESHOLD_G, 2);
+  Serial.print(" g, lpf_alpha=");
+  Serial.print(TILT_LPF_ALPHA_X1000 / 1000.0f, 2);
+  Serial.print(", offset=");
+  Serial.print(TILT_ZERO_OFFSET_G, 2);
+  Serial.println(" g");
+  Serial.println("       fires at peak-and-reversal inside zone, alternation enforced");
+  Serial.print("       gyro axis=");
+  Serial.print(accelAxisLetter(TILT_AXIS_GYRO));
+  Serial.println(" (diag only)");
   diagPrintPinWarnings();
   Serial.print("After tilt: PLAY until ");
   Serial.print(IDLE_TIMEOUT_MS);
@@ -238,10 +309,10 @@ static void diagPrintPeriodic() {
   Serial.println("--- status ---");
   Serial.print("state=");
   Serial.print(systemStateName(systemState));
-  Serial.print(" chaseActive=");
-  Serial.print(chaseActive ? 1 : 0);
-  Serial.print(" chaseFrame=");
-  Serial.print(chaseFrame);
+  Serial.print(" chase A=");
+  Serial.print(chases[CHASE_SIDE_A].active ? chases[CHASE_SIDE_A].frame : -1);
+  Serial.print(" B=");
+  Serial.print(chases[CHASE_SIDE_B].active ? chases[CHASE_SIDE_B].frame : -1);
   Serial.print(" noiseZ=");
   Serial.println(idleNoiseZ);
 
@@ -264,14 +335,30 @@ static void diagPrintPeriodic() {
   Serial.println(diagRs485Events);
 
   if (mpuOk) {
-    Serial.print("gyro=");
-    Serial.print(diagLastGyroDps, 1);
-    Serial.print(" dps motion=");
-    Serial.print(motionDirName(motionDir));
-    Serial.print(" cooldownMs=");
-    Serial.println((unsigned)cooldownTimer);
+    Serial.print("accel(g) x=");
+    Serial.print(lastAccelX, 2);
+    Serial.print(" y=");
+    Serial.print(lastAccelY, 2);
+    Serial.print(" z=");
+    Serial.print(lastAccelZ, 2);
+    Serial.print("  filteredG=");
+    Serial.print(tiltFiltered, 2);
+    Serial.print("  zone=");
+    Serial.print(tiltZoneName(tiltZone));
+    Serial.print(" peakG=");
+    if (tiltZone == ZONE_NEUTRAL) {
+      Serial.print("--");
+    } else {
+      Serial.print(tiltPeakG, 2);
+    }
+    Serial.print(" fired=");
+    Serial.print(tiltFiredThisZone ? 1 : 0);
+    Serial.print(" armed=");
+    Serial.print(armedSideName(tiltArmed));
+    Serial.print("  gyro(dps)=");
+    Serial.println(lastGyroDps, 1);
   } else {
-    Serial.println("gyro=N/A (MPU not initialized)");
+    Serial.println("accel/gyro=N/A (MPU not initialized)");
   }
 
   Serial.print("idleTimer=");
@@ -291,7 +378,6 @@ static void diagTick() {
 
 // ---- Forward decls --------------------------------------------------
 
-static float   readGyroAxis();
 static void    pollTilt();
 static void    onTiltChange(uint8_t direction);
 static void    sendEvent(uint8_t event);
@@ -299,8 +385,10 @@ static void    enterIdleState();
 static void    enterPlayState();
 static void    startChase(uint8_t direction);
 static void    tickChase();
+static bool    anyChaseActive();
 static void    tickIdle();
-static void    drawFrame(int frameIndex);
+static void    drawSideFrame(int side, int frameIndex);
+static void    clearSidePixels(int side);
 static void    drawIdleNoise();
 static void    resetIdleNoise();
 static void    clearStrips();
@@ -379,12 +467,25 @@ void setup() {
   Serial.flush();
 #endif
 
-  // Reversal-based detection only fires on a true direction change, so
-  // a tilted-at-power-up seesaw never produces a spurious chase. The
-  // first event will fire when someone actually rocks the seesaw and
-  // it bottoms out.
-  motionDir = MOTION_NONE;
-  cooldownTimer = TILT_EVENT_COOLDOWN_MS;   // start "expired"
+  // Tilt zone state machine starts in NEUTRAL with both sides armed
+  // (ARM_NONE), so a power-up while tilted past threshold still allows
+  // the *first* trigger on whichever side resolves first. The LPF is
+  // primed lazily on the first sample in pollTilt(). tiltPeakG and
+  // tiltFiredThisZone are only meaningful inside A_DOWN / B_DOWN; we
+  // re-seed them on each NEUTRAL -> X_DOWN transition.
+  tiltZone          = ZONE_NEUTRAL;
+  tiltArmed         = ARM_NONE;
+  tiltFiltered      = 0.0f;
+  tiltPrimed        = false;
+  tiltPeakG         = 0.0f;
+  tiltFiredThisZone = false;
+
+  for (size_t i = 0; i < CHASE_NUM_SIDES; i++) {
+    chases[i].active     = false;
+    chases[i].frame      = 0;
+    chases[i].step       = 1;
+    chases[i].frameTimer = 0;
+  }
 
   // Seed before entering IDLE so the EVT_STATE_IDLE boot frame's
   // resend jitter is randomized too.
@@ -413,10 +514,10 @@ void loop() {
 
   if (systemState == STATE_PLAY) {
     tickChase();
-    // After a play chase finishes and IDLE_TIMEOUT_MS has passed since
+    // After both chases finish AND IDLE_TIMEOUT_MS has passed since
     // the last tilt, drop back into IDLE. Don't yank the seesaw out of
-    // PLAY mid-chase even if the timeout expires.
-    if (!chaseActive && idleTimer >= IDLE_TIMEOUT_MS) {
+    // PLAY mid-chase, even if the timeout expires while a chase runs.
+    if (!anyChaseActive() && idleTimer >= IDLE_TIMEOUT_MS) {
       enterIdleState();
     }
   } else {
@@ -424,21 +525,50 @@ void loop() {
   }
 }
 
-// ---- Tilt detection (gyro reversal) --------------------------------
+// ---- Tilt detection (accel zones with hysteresis + alternation) ----
+//
+// pickAxis() reads the configured accel/gyro axis from a sensors_event_t.
+// readTiltSample() pulls one MPU sample, fills the diag globals, and
+// returns the length-axis acceleration in g (with the configured zero
+// offset and inversion already applied).
 
-static float readGyroAxis() {
-  if (!mpuOk) return 0.0f;
+static float pickAxis(const sensors_event_t &ev, int axis) {
+  switch (axis) {
+    case TILT_AXIS_X: return ev.acceleration.x;
+    case TILT_AXIS_Y: return ev.acceleration.y;
+    case TILT_AXIS_Z: return ev.acceleration.z;
+    default:          return 0.0f;
+  }
+}
+
+static float pickGyroAxis(const sensors_event_t &ev, int axis) {
+  switch (axis) {
+    case TILT_AXIS_X: return ev.gyro.x;
+    case TILT_AXIS_Y: return ev.gyro.y;
+    case TILT_AXIS_Z: return ev.gyro.z;
+    default:          return 0.0f;
+  }
+}
+
+// Adafruit MPU6050 reports accel in m/s^2; convert to g for thresholds.
+static const float ACCEL_MS2_PER_G = 9.80665f;
+
+static float readTiltSample() {
   sensors_event_t a, g, t;
   mpu.getEvent(&a, &g, &t);
 
-  float v = 0.0f;
-  switch (TILT_GYRO_AXIS) {
-    case TILT_GYRO_AXIS_X: v = g.gyro.x; break;
-    case TILT_GYRO_AXIS_Y: v = g.gyro.y; break;
-    case TILT_GYRO_AXIS_Z: v = g.gyro.z; break;
-  }
-  v *= 180.0f / PI;                        // rad/s -> deg/s
-  return TILT_INVERT ? -v : v;
+  // Cache raw accel for periodic diag (g units).
+  lastAccelX = a.acceleration.x / ACCEL_MS2_PER_G;
+  lastAccelY = a.acceleration.y / ACCEL_MS2_PER_G;
+  lastAccelZ = a.acceleration.z / ACCEL_MS2_PER_G;
+
+  // Gyro along pivot, deg/s, diag only.
+  lastGyroDps = pickGyroAxis(g, TILT_AXIS_GYRO) * (180.0f / PI);
+
+  float lengthG = pickAxis(a, TILT_AXIS_ACCEL) / ACCEL_MS2_PER_G;
+  if (TILT_INVERT_ACCEL) lengthG = -lengthG;
+  lengthG -= TILT_ZERO_OFFSET_G;
+  return lengthG;
 }
 
 static void pollTilt() {
@@ -446,32 +576,69 @@ static void pollTilt() {
   if (sampleTimer < TILT_SAMPLE_INTERVAL_MS) return;
   sampleTimer = 0;
 
-  float vel = readGyroAxis();
-#if SERIAL_DIAG_ENABLE
-  diagLastGyroDps = vel;
-#endif
+  const float sample = readTiltSample();
 
-  // Negative velocity = moving toward SIDE_A, positive = toward SIDE_B.
-  // Inside the +/- TILT_MIN_VELOCITY_DPS dead zone we hold the previous
-  // direction so noise around zero cannot fake a reversal.
-  if (vel <= -TILT_MIN_VELOCITY_DPS) {
-    if (motionDir == MOTION_TOWARD_B
-        && cooldownTimer >= TILT_EVENT_COOLDOWN_MS) {
-      // Reversal at the SIDE_B peak: side B just bottomed out.
-      cooldownTimer = 0;
-      onTiltChange(DIR_B);
+  // First sample seeds the LPF so we don't ramp up from 0 g over the
+  // first few hundred ms (which could spuriously cross thresholds).
+  if (!tiltPrimed) {
+    tiltFiltered = sample;
+    tiltPrimed = true;
+  } else {
+    const float alpha = TILT_LPF_ALPHA_X1000 / 1000.0f;
+    tiltFiltered += alpha * (sample - tiltFiltered);
+  }
+
+  // Schmitt-trigger zone transitions. FIRE enters the outer band;
+  // RELEASE leaves the inner band, so a small bounce around either
+  // boundary cannot rapidly toggle zones.
+  TiltZone next = tiltZone;
+  if (tiltZone != ZONE_A_DOWN && tiltFiltered > +TILT_FIRE_THRESHOLD_G) {
+    next = ZONE_A_DOWN;
+  } else if (tiltZone != ZONE_B_DOWN && tiltFiltered < -TILT_FIRE_THRESHOLD_G) {
+    next = ZONE_B_DOWN;
+  } else if (tiltZone == ZONE_A_DOWN && tiltFiltered < +TILT_RELEASE_THRESHOLD_G) {
+    next = ZONE_NEUTRAL;
+  } else if (tiltZone == ZONE_B_DOWN && tiltFiltered > -TILT_RELEASE_THRESHOLD_G) {
+    next = ZONE_NEUTRAL;
+  }
+
+  // On entering an A_DOWN / B_DOWN zone, seed the peak tracker to the
+  // current sample and clear the "already fired" latch. The fire itself
+  // happens later, the first time the signal backs off the peak by
+  // TILT_REVERSAL_DELTA_G -- i.e. when the seesaw actually reverses.
+  if (next != tiltZone) {
+    tiltZone = next;
+    if (tiltZone == ZONE_A_DOWN || tiltZone == ZONE_B_DOWN) {
+      tiltPeakG         = tiltFiltered;
+      tiltFiredThisZone = false;
     }
-    motionDir = MOTION_TOWARD_A;
-  } else if (vel >= TILT_MIN_VELOCITY_DPS) {
-    if (motionDir == MOTION_TOWARD_A
-        && cooldownTimer >= TILT_EVENT_COOLDOWN_MS) {
-      // Reversal at the SIDE_A peak: side A just bottomed out.
-      cooldownTimer = 0;
+    // Returning to NEUTRAL: nothing to fire, peak/fired bookkeeping
+    // becomes irrelevant until the next zone entry re-seeds them.
+  }
+
+  // Reversal detection inside the active zone. Update the peak first so
+  // a sample that simultaneously sets a new peak doesn't trip the fire
+  // condition on the same tick.
+  if (tiltZone == ZONE_A_DOWN) {
+    if (tiltFiltered > tiltPeakG) tiltPeakG = tiltFiltered;
+    if (!tiltFiredThisZone
+        && (tiltArmed == ARM_NONE || tiltArmed == ARM_A)
+        && tiltFiltered < tiltPeakG - TILT_REVERSAL_DELTA_G) {
+      tiltFiredThisZone = true;
+      tiltArmed = ARM_B;
       onTiltChange(DIR_A);
     }
-    motionDir = MOTION_TOWARD_B;
+  } else if (tiltZone == ZONE_B_DOWN) {
+    if (tiltFiltered < tiltPeakG) tiltPeakG = tiltFiltered;
+    if (!tiltFiredThisZone
+        && (tiltArmed == ARM_NONE || tiltArmed == ARM_B)
+        && tiltFiltered > tiltPeakG + TILT_REVERSAL_DELTA_G) {
+      tiltFiredThisZone = true;
+      tiltArmed = ARM_A;
+      onTiltChange(DIR_B);
+    }
   }
-  // else: in dead zone, motionDir is held.
+  // ZONE_NEUTRAL: no fires; we just wait for the next zone entry.
 }
 
 static void onTiltChange(uint8_t direction) {
@@ -508,10 +675,14 @@ static void enterIdleState() {
 #endif
   systemState = STATE_IDLE;
   idleFrameTimer = 0;
-  // idleNoiseZ is intentionally NOT reset here, so the noise field
-  // appears continuous across PLAY -> IDLE transitions. Call
-  // resetIdleNoise() instead if you want each idle session to start
-  // from a fixed point in the noise.
+  // idleFadeTimer drives a 0 -> 100% brightness ramp over
+  // IDLE_FADE_IN_MS in drawIdleNoise(); reset here so every IDLE entry
+  // (boot, PLAY -> IDLE) fades in from black instead of snapping on.
+  // idleNoiseZ is intentionally NOT reset, so the noise field appears
+  // continuous across PLAY -> IDLE transitions. Call resetIdleNoise()
+  // instead if you want each idle session to start from a fixed point
+  // in the noise.
+  idleFadeTimer = 0;
   drawIdleNoise();
   sendEvent(EVT_STATE_IDLE);
 }
@@ -521,11 +692,11 @@ static void enterPlayState() {
   Serial.println("-> enterPlayState");
 #endif
   systemState = STATE_PLAY;
-  // Wipe any in-progress idle animation so the new chase starts from
-  // a clean slate. The chase's drawFrame() handles black-fill of the
-  // non-active pair on every frame, but the idle animation may have
-  // painted pixels past CHASE_NUM_LEDS or on the active pair too;
-  // clearStrips() handles both at once.
+  // Wipe any in-progress idle animation so each side's chase starts
+  // from a clean slate. drawSideFrame() only writes its own side's
+  // pixels (intentionally, so concurrent chases coexist), so we need
+  // to zero the other side's pixels and any pixels past CHASE_NUM_LEDS
+  // before the first chase frame draws.
   clearStrips();
   sendEvent(EVT_STATE_PLAY);
 }
@@ -562,66 +733,105 @@ static void sendEvent(uint8_t event) {
   }
 }
 
-// ---- Chase playback -------------------------------------------------
+// ---- Chase playback (per side) -------------------------------------
+//
+// One ChaseState per physical side. Each tilt event starts that side's
+// chase ONLY if it isn't already running (do not interrupt). Both sides
+// can run concurrently when the rider rocks faster than a single chase
+// plays out, and each side draws only into its own pair of strips.
+
+static LedStrip* const* sideStrips(int side) {
+  return (side == CHASE_SIDE_A) ? stripsA : stripsB;
+}
 
 static void startChase(uint8_t direction) {
-  if (direction == DIR_A) {
-    chaseFrame = 0;
-    chaseStep  = 1;
-    chaseSide  = CHASE_ON_SIDE_A;
-  } else {
-    chaseFrame = CHASE_NUM_FRAMES - 1;
-    chaseStep  = -1;
-    chaseSide  = CHASE_ON_SIDE_B;
+  const int side = (direction == DIR_A) ? CHASE_SIDE_A : CHASE_SIDE_B;
+
+  if (chases[side].active) {
+    // Triggered side is already animating; never interrupt. The bus
+    // event was already sent in onTiltChange so audio still fires.
+    return;
   }
-  chaseActive = true;
-  frameTimer  = 0;
-  drawFrame(chaseFrame);
+
+  if (direction == DIR_A) {
+    chases[side].frame = 0;
+    chases[side].step  = 1;
+  } else {
+    chases[side].frame = CHASE_NUM_FRAMES - 1;
+    chases[side].step  = -1;
+  }
+  chases[side].active     = true;
+  chases[side].frameTimer = 0;
+  drawSideFrame(side, chases[side].frame);
+  // Push frame 0 immediately so the user sees instant feedback; the
+  // tickChase pump won't advance this side until FRAME_INTERVAL_MS.
+  showStrips();
+}
+
+static bool anyChaseActive() {
+  for (size_t i = 0; i < CHASE_NUM_SIDES; i++) {
+    if (chases[i].active) return true;
+  }
+  return false;
 }
 
 static void tickChase() {
-  if (!chaseActive) return;
-  if (frameTimer < FRAME_INTERVAL_MS) return;
-  frameTimer -= FRAME_INTERVAL_MS;
+  bool anyAdvanced = false;
 
-  int next = chaseFrame + chaseStep;
-  if (next < 0 || next >= (int)CHASE_NUM_FRAMES) {
-    chaseActive = false;
-    clearStrips();
-    showStrips();
-    return;
+  for (size_t i = 0; i < CHASE_NUM_SIDES; i++) {
+    ChaseState &c = chases[i];
+    if (!c.active) continue;
+    if (c.frameTimer < FRAME_INTERVAL_MS) continue;
+    c.frameTimer -= FRAME_INTERVAL_MS;
+
+    const int next = c.frame + c.step;
+    if (next < 0 || next >= (int)CHASE_NUM_FRAMES) {
+      c.active = false;
+      clearSidePixels((int)i);
+      anyAdvanced = true;
+      continue;
+    }
+    c.frame = next;
+    drawSideFrame((int)i, c.frame);
+    anyAdvanced = true;
   }
-  chaseFrame = next;
-  drawFrame(chaseFrame);
+
+  if (anyAdvanced) showStrips();
 }
 
 static inline uint8_t scaleBrightness(uint8_t v) {
   return (uint8_t)(((uint16_t)v * (uint16_t)LED_BRIGHTNESS) / 255);
 }
 
-static void drawFrame(int frameIndex) {
+// Render one frame of the chase onto a single side's pair of strips.
+// frameIndex is already in chase[] order: side A walks 0..N-1 (forward)
+// and side B walks N-1..0 (reverse), driven by ChaseState.step in
+// startChase(). Other side's pixels are NOT touched, so a concurrent
+// chase on the other side keeps animating undisturbed. Pixel writes
+// happen here; the actual NeoPixel show() is batched by tickChase().
+static void drawSideFrame(int side, int frameIndex) {
 #if SERIAL_DIAG_ENABLE
   diagChaseDraws++;
 #endif
-  // Active pair gets the chase frame; the other pair is held dark for
-  // the duration of the chase so feedback localizes to the triggered
-  // side. The inactive pair is blanked here on every frame so a fresh
-  // chase that fires on the opposite side immediately darkens the
-  // previously-lit pair without needing a separate clear step.
-  LedStrip* const* active   = (chaseSide == CHASE_ON_SIDE_A) ? stripsA : stripsB;
-  LedStrip* const* inactive = (chaseSide == CHASE_ON_SIDE_A) ? stripsB : stripsA;
-
+  LedStrip* const* pair = sideStrips(side);
   for (int i = 0; i < (int)STRIP_NUM_LEDS; i++) {
     const int src = i % (int)CHASE_NUM_LEDS;
     uint8_t r = scaleBrightness(pgm_read_byte(&chase[frameIndex][src * 3 + 0]));
     uint8_t g = scaleBrightness(pgm_read_byte(&chase[frameIndex][src * 3 + 1]));
     uint8_t b = scaleBrightness(pgm_read_byte(&chase[frameIndex][src * 3 + 2]));
     for (size_t s = 0; s < STRIPS_PER_SIDE; s++) {
-      active[s]->setPixel(i, r, g, b);
-      inactive[s]->setPixel(i, 0, 0, 0);
+      pair[s]->setPixel(i, r, g, b);
     }
   }
-  showStrips();
+}
+
+static void clearSidePixels(int side) {
+  LedStrip* const* pair = sideStrips(side);
+  for (int i = 0; i < (int)STRIP_NUM_LEDS; i++) {
+    for (size_t s = 0; s < STRIPS_PER_SIDE; s++) {
+      pair[s]->setPixel(i, 0, 0, 0);
+    }
+  }
 }
 
 // ---- Idle animation (IDLE mode) ------------------------------------
@@ -644,10 +854,20 @@ static void drawIdleNoise() {
 #if SERIAL_DIAG_ENABLE
   diagIdleDraws++;
 #endif
+  // Fade-in scale: linear ramp from 0 to 255 over IDLE_FADE_IN_MS,
+  // saturating at 255 thereafter. IDLE_FADE_IN_MS == 0 disables the
+  // fade and starts at full brightness immediately.
+  uint8_t fadeScale = 255;
+#if IDLE_FADE_IN_MS > 0
+  if ((uint32_t)idleFadeTimer < (uint32_t)IDLE_FADE_IN_MS) {
+    fadeScale = (uint8_t)(((uint32_t)idleFadeTimer * 255u) / (uint32_t)IDLE_FADE_IN_MS);
+  }
+#endif
   for (size_t s = 0; s < NUM_STRIPS; s++) {
     for (int i = 0; i < (int)STRIP_NUM_LEDS; i++) {
       uint8_t v = sampleIdleNoise((uint8_t)s, (uint16_t)i, idleNoiseZ);
       v = scaleBrightness(v);
+      v = (uint8_t)(((uint16_t)v * (uint16_t)fadeScale) / 255);
       allStrips[s]->setPixel(i, v, v, v);
     }
   }

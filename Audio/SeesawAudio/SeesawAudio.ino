@@ -1,5 +1,5 @@
 // =====================================================================
-// Seesaws central audio node (Teensy 3.2 + PJRC Audio Shield)
+// Seesaws central audio node (Teensy 4.0 + PJRC Audio Shield Rev D)
 // =====================================================================
 //
 // Listens on RS485 for tilt events from the seesaw firmware and plays
@@ -16,7 +16,7 @@
 // No config file or code change is needed to add a seesaw - drop in WAVs.
 //
 // Hardware:
-//   - Teensy 3.2 + Audio Shield (line-out or headphone to your amp)
+//   - Teensy 4.0 + Audio Shield Rev D (line-out or headphone to your amp)
 //   - MAX3485 on Serial1: RX pin 0, TX pin 1, DE+RE pin 2
 //   - Bias + termination at this (rack) end of the RS485 bus
 //

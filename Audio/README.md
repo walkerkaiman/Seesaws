@@ -1,4 +1,4 @@
-# Audio node (Teensy 3.2 + Audio Shield)
+# Audio node (Teensy 4.0 + Audio Shield Rev D)
 
 Polyphonic audio player that listens on RS485 for tilt events from the seesaws and plays WAV files from the Audio Shield SD card. Multiple sounds overlap freely — new tilts never cut off sounds already playing.
 
@@ -15,7 +15,7 @@ See the [root README](../README.md) for system architecture and wiring.
 
 ## Hardware
 
-- **Teensy 3.2** + **PJRC Audio Shield** (Rev B or later)
+- **Teensy 4.0** + **PJRC Audio Shield Rev D** (the Rev D shield is the one for the Teensy 4.x family)
 - **MAX3485** or **SN65HVD3082** on **Serial1** (RX pin 0, TX pin 1, DE+RE on pin 2 — same pinout as the seesaw firmware)
 - **microSD card** in the Audio Shield (FAT32, copy the `sounds/` folder to the card root)
 - Line-out or headphone jack on the shield → your rack amplifier or powered speakers
@@ -29,7 +29,7 @@ flowchart LR
     subgraph rack [Central weatherproof rack box - mains AC inlet]
         Mains["Mains inlet"]
         PSU24["24V central PSU"]
-        TAudio["Teensy 3.2 + Audio Shield"]
+        TAudio["Teensy 4.0 + Audio Shield Rev D"]
         Amp["Audio amplifier<br/>(if not using powered speakers)"]
         XCVR["MAX3485 on Serial1"]
         Bias["Bias resistors<br/>~680 ohm A to 3V3<br/>~680 ohm B to GND"]
@@ -72,7 +72,7 @@ Copy the repo's [sounds/](sounds/) directory to the **root** of the microSD so t
 ## Teensyduino setup
 
 1. Install [Arduino IDE](https://www.arduino.cc/en/software) and [Teensyduino](https://www.pjrc.com/teensy/td_download.html).
-2. **Tools → Board → Teensyduino → Teensy 3.2**.
+2. **Tools → Board → Teensyduino → Teensy 4.0**.
 3. Install the **Audio** library via **Sketch → Include Library → Manage Libraries** if it is not already bundled with Teensyduino.
 4. Open [SeesawAudio/SeesawAudio.ino](SeesawAudio/SeesawAudio.ino).
 5. Prepare the SD card (copy `sounds/` onto it), insert into the shield.

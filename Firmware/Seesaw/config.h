@@ -47,6 +47,13 @@
 // for the procedural noise idle (smooth drift). Independent of CHASE_FPS.
 #define IDLE_FPS         30
 
+// Fade-in duration when entering IDLE (ms). The grayscale noise field
+// starts at 0% brightness and ramps linearly to 100% over this many
+// milliseconds. Applies to both the boot-into-IDLE transition and
+// every PLAY -> IDLE transition (so the chase doesn't snap back to a
+// bright shimmer the instant the timeout expires). Set to 0 to disable.
+#define IDLE_FADE_IN_MS  3000
+
 // ---- Idle noise tuning (see idle_noise.h) --------------------------
 //
 // IDLE_NOISE_Z_STEP    z-axis (time) advance per idle tick. Smaller =
@@ -134,50 +141,89 @@
 #define RS485_RESEND_JITTER_MIN_MS  5
 #define RS485_RESEND_JITTER_MAX_MS  25
 
-// ---- Tilt detection (MPU6050 gyro reversal) -------------------------
+// ---- Tilt detection (MPU6050 accel peak-on-reversal) ----------------
 //
-// Tilt events fire the moment the seesaw *reverses direction* - when one
-// side reaches its lowest point and starts coming back up. This is the
-// "thump" / impact moment, and it works at any amplitude: a small child
-// who only rocks the seesaw a few degrees and an adult who swings through
-// 30 degrees both reliably trigger the same way.
+// Triggers fire when the seesaw bottoms out on one side and starts
+// reversing -- the "thump" moment the rider feels. The accelerometer
+// signal along the seesaw length is low-pass filtered; once it crosses
+// TILT_FIRE_THRESHOLD_G on one side we enter that side's zone and start
+// tracking a running peak. The fire happens the first time the filtered
+// signal drops back from that peak by at least TILT_REVERSAL_DELTA_G --
+// i.e. the seesaw has actually started swinging the other way. The
+// signal must come back through TILT_RELEASE_THRESHOLD_G (hysteresis)
+// before that side can re-arm. An armed-side flag enforces alternation
+// -- the same side never fires twice in a row, regardless of bounce or
+// hand-jitter.
 //
-// The MPU6050's gyroscope reports angular velocity (deg/s) around three
-// axes. Pick the axis aligned with the seesaw's *rotation* axis - this is
-// the axis the seesaw rotates around, typically perpendicular to the
-// seesaw's length. With a typical breakout sitting flat on the seesaw
-// deck and X aligned to the length, the seesaw rotates around Y, so
-// TILT_GYRO_AXIS = TILT_GYRO_AXIS_Y.
+// Sensor-to-seesaw axis mapping (this build):
 //
-// Convention: negative velocity means moving toward SIDE_A; positive
-// means moving toward SIDE_B. Use TILT_INVERT to flip this if your
-// mounting gives the opposite sign.
+//   The MPU-6050 die has +X right, +Y up, +Z out of the package when
+//   pin 1 (the chip's dot marker) is at the top-left of the die. The
+//   GY-521 breakout puts that dot at the bottom-left of the board with
+//   the chip rotated 90 degrees clockwise relative to the silkscreen,
+//   so on this install:
 //
-// State machine:
-//   - Below |TILT_MIN_VELOCITY_DPS| we hold the previous direction
-//     (so noise around zero cannot produce fake reversals).
-//   - Crossing from "moving toward A" to "moving toward B" fires DIR_A
-//     (side A just peaked). Symmetrically for DIR_B.
-//   - After firing we suppress further events for TILT_EVENT_COOLDOWN_MS
-//     so a fast bounce can't re-interrupt the chase.
+//     - chip +Y points along the right edge of the breakout, which
+//       this install aligns with the seesaw's *length* (perpendicular
+//       to the pivot). Tilting projects gravity onto accel Y as
+//       g * sin(angle); this is the trigger signal.
+//     - chip +X points along the bottom edge -- the seesaw's *pivot
+//       rotation* axis. Gyro X carries rocking velocity; we read it
+//       only for diagnostics.
+//     - chip +Z is the deck normal.
+//
+//   If a future build mounts the breakout differently, change
+//   TILT_AXIS_ACCEL / TILT_AXIS_GYRO. Set TILT_INVERT_ACCEL = true if
+//   pushing SIDE_A down makes accel-on-the-length go negative.
 
 #define MPU_I2C_ADDR                  0x68    // 0x68 default; 0x69 if AD0 = HIGH
 
-#define TILT_GYRO_AXIS_X 0
-#define TILT_GYRO_AXIS_Y 1
-#define TILT_GYRO_AXIS_Z 2
-#define TILT_GYRO_AXIS                TILT_GYRO_AXIS_Y
-#define TILT_INVERT                   false   // true if positive velocity should map to SIDE_A
+#define TILT_AXIS_X 0
+#define TILT_AXIS_Y 1
+#define TILT_AXIS_Z 2
 
-// Minimum sustained angular velocity (deg/s) to count as real motion.
-// MPU6050 noise is well under 1 dps, so 10-20 dps catches even gentle
-// seesaw motion while ignoring vibration. Lower = more sensitive.
-#define TILT_MIN_VELOCITY_DPS         15.0f
+// Which accelerometer axis lies along the seesaw length. Sign + means
+// SIDE_A is "down" (gravity pulls chip in this direction). Flip
+// TILT_INVERT_ACCEL if your mounting gives the opposite polarity.
+#define TILT_AXIS_ACCEL               TILT_AXIS_Y
+#define TILT_INVERT_ACCEL             false
 
-// After firing an event, suppress further events for this many ms.
-// Prevents a fast-bounce double-trigger from re-interrupting the chase.
-// 150 ms allows up to ~6 events/s - faster than humans can rock.
-#define TILT_EVENT_COOLDOWN_MS        150
+// Gyro axis along the pivot. Used only for the periodic diagnostic
+// printout; not part of the trigger logic.
+#define TILT_AXIS_GYRO                TILT_AXIS_X
 
-// Gyro sampling. 100 Hz catches the reversal moment within ~10 ms.
+// Schmitt-trigger thresholds for entering / leaving an A-down or
+// B-down zone, expressed in g (accel reading after offset + invert).
+//   FIRE: must cross to enter the zone and start watching for reversal.
+//   RELEASE: must come back inside this band before the same side can
+//            re-arm. RELEASE strictly less than FIRE.
+// 0.30 g is roughly 17 deg of tilt; 0.18 g is roughly 10 deg. Tune to
+// your mechanical range; pick FIRE at ~60-70% of bottomed-out reading.
+#define TILT_FIRE_THRESHOLD_G         0.30f
+#define TILT_RELEASE_THRESHOLD_G      0.18f
+
+// Reversal detection: fire only after the filtered accel has come
+// back from its peak inside the active zone by at least this many g.
+// 0.05 g is roughly 3 deg of swing back, which is well above noise
+// at the LPF cutoff but still much smaller than a real seesaw stroke.
+// Bumping this delays the fire toward the actual peak (more "thump"
+// feel, less responsive); shrinking it fires earlier but is more
+// sensitive to chatter at the peak.
+#define TILT_REVERSAL_DELTA_G         0.05f
+
+// Single-pole IIR low-pass on the accel-along-length signal. Stored
+// as alpha * 1000 so the macro is unambiguous integer.
+//   filtered += alpha * (sample - filtered)
+// At 100 Hz sample rate, alpha = 0.20 gives roughly a 3 Hz cutoff,
+// which kills vibration without lagging perceived seesaw motion.
+#define TILT_LPF_ALPHA_X1000          200
+
+// Subtract from raw accel-along-length before thresholding. Use this
+// only if the seesaw doesn't sit at 0 g on this axis when undisturbed
+// (mounting offset, deck not perfectly level). Read the periodic diag
+// "filteredG=" line at rest to pick a value.
+#define TILT_ZERO_OFFSET_G            0.00f
+
+// Sample period. 100 Hz is plenty for human-rocking timescales and
+// gives the LPF a useful cutoff.
 #define TILT_SAMPLE_INTERVAL_MS       10
